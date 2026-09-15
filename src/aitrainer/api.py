@@ -1,4 +1,18 @@
-"""Stable public API for the first delivery batch."""
+"""The curated public surface.
+
+This is the only place the framework's public names are enumerated.  It is a
+hand-written list rather than a wildcard re-export, so the boundary is a decision
+rather than an accident: adding something to a subsystem does not silently
+publish it.
+
+Names are grouped by the layer they come from (see ``docs/架构.md``) -- the
+import block above is laid out in layer order, foundations through interfaces,
+and each import names its source module.
+
+``__all__`` itself is alphabetical rather than grouped, because ruff's RUF022
+requires it to be sorted and a layer-grouped list is not.  Ordering is worth
+less here than the linter rule; the imports above carry the grouping.
+"""
 
 from .adapters import DataProvider, LossFn, ModelAdapter, OptimizerFactory
 from .capability import (
