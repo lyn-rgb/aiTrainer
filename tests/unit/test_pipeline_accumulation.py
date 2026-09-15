@@ -55,6 +55,6 @@ def test_pipeline_step_reports_the_unscaled_loss():
             (inputs, targets),
             loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]),
             accumulation_steps=accumulation_steps)
-        return float(result["loss"])
+        return float(result.loss)
 
     assert reported(1) == pytest.approx(reported(4), rel=1e-6)

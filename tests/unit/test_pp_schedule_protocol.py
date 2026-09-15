@@ -100,7 +100,48 @@ class _FakeCommunicator:
         self.hub.check("backward", spec, got)
         return grad.detach().clone()      # received into a fresh buffer, as the real path does
 
+    # --- the async / dynamic half of the surface ---------------------------
+    # The production path uses these: it cannot know a neighbour's shapes before
+    # the header arrives, and it issues sends without blocking on compute.
+
+    def send_forward_async(self, tensor, *, spec=None):
+        self.send_forward(tensor, spec=spec)
+        return _FakeWork()
+
+    def send_backward_async(self, grad, *, spec=None):
+        self.send_backward(grad, spec=spec)
+        return _FakeWork()
+
+    def recv_forward_dynamic(self, *, device=None):
+        """No shape is known in advance -- but the LABEL is still checkable.
+
+        A sender labels the spec with its own stage id, so an activation arriving
+        at rank r must carry ``stage == r - 1``.  Skipping the check here because
+        "the dynamic path has no expectation" would leave the production receive
+        path with no metadata validation at all, which is precisely what the rest
+        of this harness exists to provide.
+        """
+        tensor, got = self.hub.queue_for("forward", self.pp_rank - 1, self.pp_rank).get(timeout=TIMEOUT)
+        self.hub.check("forward", TensorSpec(got.shape, got.dtype, got.device,
+                                             self.pp_rank - 1, got.microbatch, "forward"), got)
+        return tensor.detach().clone().requires_grad_(True), got
+
+    def recv_backward_dynamic(self, *, device=None):
+        grad, got = self.hub.queue_for("backward", self.pp_rank + 1, self.pp_rank).get(timeout=TIMEOUT)
+        # The downstream stage reuses the forward spec it received, which was
+        # labelled with THIS rank's id.
+        self.hub.check("backward", TensorSpec(got.shape, got.dtype, got.device,
+                                              self.pp_rank, got.microbatch, "backward"), got)
+        return grad.detach().clone(), got
+
     def drain(self) -> None:
+        return None
+
+
+class _FakeWork:
+    """Stand-in for ``P2PWork``: the hub queue is already unbounded, so waiting is a no-op."""
+
+    def wait(self) -> None:
         return None
 
 

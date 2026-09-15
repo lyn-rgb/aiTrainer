@@ -231,7 +231,7 @@ class Trainer:
                 result = self.model.module.pipeline_step(
                     batch, loss_fn=self.loss_fn, scaler=self.scaler,
                     accumulation_steps=self.config.grad_accumulation_steps)
-            loss_value = result.get("loss")
+            loss_value = result.loss          # ScheduleOutput, not a dict
             raw_loss = float(loss_value.float().item()) if torch.is_tensor(loss_value) else 0.0
             self.global_step += 1
             should_step = self.global_step % self.config.grad_accumulation_steps == 0
@@ -337,7 +337,7 @@ class Trainer:
                 batch = move_to(batch, self.device)
                 if bool(getattr(self.model.module, "uses_pipeline", False)):
                     result = self.model.module.pipeline_evaluate(batch, loss_fn=self.loss_fn)
-                    value = result.get("loss")
+                    value = result.loss
                     if torch.is_tensor(value):
                         losses.append(float(value.float().item()))
                     continue
