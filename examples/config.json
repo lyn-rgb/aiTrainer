@@ -1,0 +1,35 @@
+{
+  "parallel": {
+    "dp_size": 1,
+    "tp_size": 1,
+    "pp_size": 1,
+    "sp_backend": "none",
+    "pp_schedule": "none",
+    "num_microbatches": 1
+  },
+  "precision": {
+    "param_dtype": "float32",
+    "compute_dtype": "bfloat16",
+    "grad_dtype": "float32",
+    "reduce_dtype": "float32",
+    "optimizer_dtype": "float32"
+  },
+  "fsdp": {
+    "enabled": false
+  },
+  "offload": {
+    "enabled": false
+  },
+  "overlap": {},
+  "planning": {
+    "enabled": false
+  },
+  "checkpoint": {
+    "interval": 0
+  },
+  "grad_accumulation_steps": 2,
+  "grad_clip_norm": 1.0,
+  "seed": 123,
+  "log_interval": 1,
+  "device": "cpu"
+}

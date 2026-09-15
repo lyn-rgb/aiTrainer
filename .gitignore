@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# Training and benchmark artifacts
+*.pt
+tiny-transformer.pt/
+artifacts/
+
+# macOS
+.DS_Store
+
+# Vendored reference checkouts (Megatron-LM / DeepSpeed / Ulysses).
+# Read-only implementation references: never packaged, and
+# scripts/check_no_reference_imports.py fails the build if any src import
+# reaches into this directory.
+references/
