@@ -11,4 +11,5 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: ruff check src tests examples
       - run: python scripts/check_no_reference_imports.py
+      - run: lint-imports
       - run: pytest -q
