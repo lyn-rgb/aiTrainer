@@ -432,7 +432,7 @@ def test_overlap_budget_bounds_inflight_ops():
     from aitrainer.lifecycle import AsyncOp
     from aitrainer.overlap.controller import OverlapController
 
-    controller = OverlapController(enabled=True, max_inflight_ops=2)
+    controller = OverlapController(max_inflight_ops=2)
     for index in range(6):
         op = AsyncOp(f"op{index}")
         controller.submit_op(op)
@@ -559,7 +559,7 @@ def test_overlap_peak_is_a_concurrency_high_water_mark():
     from aitrainer.overlap.controller import OverlapController
     from aitrainer.overlap.metrics import OverlapMetrics
 
-    controller = OverlapController(enabled=True)
+    controller = OverlapController()
     for index in range(100):
         op = AsyncOp(f"op{index}")
         controller.submit_op(op)

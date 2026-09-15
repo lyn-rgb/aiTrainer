@@ -38,13 +38,12 @@ class DistributedModel:
 class PipelineStage:
     """A stage module plus immutable stage metadata and schedule ownership."""
 
-    def __init__(self, module: Any, *, stage_id: int, stage_plan: Any,
+    def __init__(self, module: Any, *, stage_id: int,
                  schedule: Any = None, pp_group: Any = None, pp_size: int = 1,
                  pp_ranks: tuple[int, ...] | None = None, num_microbatches: int = 1,
                  tp_rank: int = 0, dp_rank: int = 0) -> None:
         self.module = module
         self.stage_id = stage_id
-        self.stage_plan = stage_plan
         self.schedule = schedule
         self.pp_group = pp_group
         self.pp_size = pp_size
@@ -52,7 +51,6 @@ class PipelineStage:
         self.num_microbatches = num_microbatches
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
-        self._pipeline_backward_complete = False
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.module(*args, **kwargs)
@@ -85,15 +83,6 @@ class PipelineStage:
 
     def load_state_dict(self, state: dict[str, Any], **kwargs: Any) -> Any:
         return self.module.load_state_dict(state, **kwargs)
-
-    @property
-    def backward_complete(self) -> bool:
-        # On the production path `schedule` is a plain STRING ("gpipe"/"1f1b") --
-        # pipeline_step dispatches on it -- so consulting it for a flag is
-        # misleading; the instance flag below is what actually tracks completion.
-        from_schedule = (getattr(self.schedule, "_backward_complete", False)
-                         if not isinstance(self.schedule, str) else False)
-        return bool(self._pipeline_backward_complete or from_schedule)
 
     @property
     def uses_pipeline(self) -> bool:
@@ -209,7 +198,6 @@ class PipelineStage:
                 backward_spec = TensorSpec(spec.shape, spec.dtype, spec.device, spec.stage, spec.microbatch, "backward")
                 communicator.send_backward(activation.grad, spec=backward_spec)
         communicator.drain()
-        self._pipeline_backward_complete = True
         loss_value = torch.stack(losses).mean() if losses else None
         return {"loss": loss_value, "is_last_stage": communicator.is_last,
                 "backward_complete": True}
@@ -302,7 +290,6 @@ class PipelineStage:
         for work in pending:
             work.wait()
         communicator.drain()
-        self._pipeline_backward_complete = True
         return {"loss": torch.stack(losses).mean() if losses else None,
                 "is_last_stage": communicator.is_last, "backward_complete": True}
 

@@ -12,10 +12,6 @@ from .config import FrameworkConfig
 from .topology import inspect_hardware, make_rank_mapping
 
 
-class DiagnosticError(RuntimeError):
-    """Structured diagnostic failure with actionable context."""
-
-
 def diagnose_exception(exc: BaseException, *, rank: int = 0, group: str | None = None,
                        stage: int | None = None, microbatch: int | None = None,
                        module: str | None = None, tensor: Any = None) -> dict[str, Any]:

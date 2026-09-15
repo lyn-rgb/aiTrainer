@@ -17,7 +17,7 @@ import shutil
 import tempfile
 from typing import Any, Mapping
 
-from .format import Manifest, file_checksum, write_manifest
+from .format import file_checksum
 
 
 def _remove_path(path: Path) -> None:
@@ -93,7 +93,7 @@ class CheckpointManager:
              scheduler: Any = None, scaler: Any = None, global_step: int = 0,
              optimizer_step: int = 0, config: Mapping[str, Any] | None = None,
              sampler_state: Mapping[str, Any] | None = None,
-             manifest: Manifest | None = None, rank_mapping: Mapping[str, Any] | None = None) -> Path:
+             rank_mapping: Mapping[str, Any] | None = None) -> Path:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         rank, world_size, backend, _ = self._runtime_values()
@@ -116,8 +116,6 @@ class CheckpointManager:
             metadata_path.write_text(json.dumps(asdict(metadata), indent=2, sort_keys=True) + "\n", encoding="utf-8")
             with metadata_path.open("rb") as handle:
                 os.fsync(handle.fileno())
-            if manifest is not None:
-                write_manifest(manifest, temporary / "manifest.json")
             checksums = {str(item.relative_to(temporary)): file_checksum(item)
                          for item in temporary.rglob("*") if item.is_file()}
             (temporary / "checksums.json").write_text(json.dumps(checksums, indent=2, sort_keys=True) + "\n",

@@ -24,7 +24,7 @@ def _module() -> torch.nn.Module:
 
 def _grads(accumulation_steps: int, inputs: torch.Tensor, targets: torch.Tensor) -> list[torch.Tensor]:
     module = _module()
-    stage = PipelineStage(module, stage_id=0, stage_plan=None, pp_size=1)
+    stage = PipelineStage(module, stage_id=0, pp_size=1)
     stage.pipeline_step((inputs, targets),
                         loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]),
                         accumulation_steps=accumulation_steps)
@@ -50,7 +50,7 @@ def test_pipeline_step_reports_the_unscaled_loss():
 
     def reported(accumulation_steps: int) -> float:
         module = _module()
-        stage = PipelineStage(module, stage_id=0, stage_plan=None, pp_size=1)
+        stage = PipelineStage(module, stage_id=0, pp_size=1)
         result = stage.pipeline_step(
             (inputs, targets),
             loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]),

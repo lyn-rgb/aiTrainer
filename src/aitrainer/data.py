@@ -108,31 +108,3 @@ class StatefulSampler:
         self.seed = int(state.get("seed", self.seed))
         if hasattr(self.sampler, "load_state_dict"):
             self.sampler.load_state_dict(dict(state))
-
-
-class DataProviderAdapter:
-    """Adapter that exposes loader, epoch and sampler state without guessing."""
-
-    def __init__(self, loader_factory: Any, *, sampler: StatefulSampler | None = None,
-                 contract: BatchContract | None = None) -> None:
-        self.loader_factory = loader_factory
-        self.sampler = sampler
-        self.contract = contract or BatchContract()
-        self.contract.validate()
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-        if self.sampler is not None:
-            self.sampler.set_epoch(self.epoch)
-
-    def train_dataloader(self, *, dp_group: Any = None, seed: int = 42) -> Iterable[Any]:
-        return self.loader_factory(dp_group=dp_group, seed=seed, epoch=self.epoch)
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"epoch": self.epoch, "sampler": self.sampler.state_dict() if self.sampler else None}
-
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        self.epoch = int(state.get("epoch", 0))
-        if self.sampler is not None and state.get("sampler") is not None:
-            self.sampler.load_state_dict(state["sampler"])

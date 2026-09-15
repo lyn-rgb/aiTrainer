@@ -114,11 +114,6 @@ class FSDPWrapper:
         cfg = FullStateDictConfig(offload_to_cpu=offload, rank0_only=False)
         return self._fsdp.state_dict_type(self.module, state, cfg)
 
-    def sharded_state_dict_context(self):
-        from torch.distributed.fsdp import StateDictType
-        state = StateDictType.SHARDED_STATE_DICT
-        return self._fsdp.state_dict_type(self.module, state)
-
 
 def wrap_fsdp(module: Any, *, runtime: Any, mesh: Any = None, config: Any = None) -> FSDPWrapper:
     """Wrap a TP/SP-transformed stage using only its orthogonal DP group."""

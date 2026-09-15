@@ -124,12 +124,6 @@ class ParameterOffloader:
         op._wait_fn = lambda fn: fn()
         return op
 
-    def finalize_trace(self, expected: Any = None) -> bool:
-        return self.trace.finalize(expected)
-
-    def invalidate_trace(self) -> None:
-        self.trace.invalidate()
-
     def release(self, parameter: Any | None = None, module: Any | None = None) -> int:
         if parameter is None and module is None:
             raise ParameterOffloadError("release requires parameter or module")

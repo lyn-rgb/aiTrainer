@@ -12,18 +12,22 @@ from typing import Any, Literal
 
 @dataclass(frozen=True)
 class ModelLoadConfig:
+    """Loading policy. Only these four fields are read by ``checkpoint.reader``.
+
+    ``cpu_buffer_bytes``, ``max_inflight_reads``, ``pin_memory`` and ``node_cache``
+    used to sit here; the reader performs sequential ``torch.load`` calls, never
+    consulted them, and they are gone rather than left implying the loader is
+    buffered, concurrent or pinned.
+    """
+
     mode: Literal["direct_sharded", "rank0_legacy", "convert_then_load"] = "direct_sharded"
     reader: Literal["dcp", "safetensors", "torch"] = "torch"
-    cpu_buffer_bytes: int = 2 * 1024**3
-    max_inflight_reads: int = 2
-    pin_memory: bool = True
     verify_checksum: bool = True
     allow_world_size_change: bool = False
-    node_cache: Literal["none", "page_cache", "local_nvme"] = "page_cache"
 
     def validate(self) -> None:
-        if self.cpu_buffer_bytes < 1 or self.max_inflight_reads < 1:
-            raise ValueError("model loading buffer and concurrency limits must be positive")
+        if self.reader not in {"dcp", "safetensors", "torch"}:
+            raise ValueError(f"model load reader={self.reader!r} is not supported")
 
 
 @dataclass(frozen=True)

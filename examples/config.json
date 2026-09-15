@@ -8,7 +8,6 @@
     "num_microbatches": 1
   },
   "precision": {
-    "param_dtype": "float32",
     "compute_dtype": "bfloat16",
     "grad_dtype": "float32",
     "reduce_dtype": "float32",
@@ -23,9 +22,6 @@
   "overlap": {},
   "planning": {
     "enabled": false
-  },
-  "checkpoint": {
-    "interval": 0
   },
   "grad_accumulation_steps": 2,
   "grad_clip_norm": 1.0,

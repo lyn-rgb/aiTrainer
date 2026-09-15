@@ -49,7 +49,6 @@ class P2PCommunicator:
         self.pp_ranks = pp_ranks
         self.timeout_seconds = timeout_seconds
         self._pending: list[P2PWork] = []
-        self._posted: dict[tuple[int, int, str], P2PWork] = {}
 
     @property
     def is_first(self) -> bool:
@@ -155,93 +154,6 @@ class P2PCommunicator:
         self._pending.append(work)
         return work
 
-    def post_recv_forward(self, spec: TensorSpec | None = None, *, device: Any | None = None,
-                          microbatch: int | None = None) -> P2PWork:
-        """Prepost a forward receive; allocation is explicit and metadata is validated on wait."""
-        if spec is None:
-            if device is None: raise P2PError("post_recv_forward requires spec or device")
-            # Dynamic metadata cannot be allocated until the header arrives; use a
-            # synchronous dynamic receive when the handle is waited.
-            holder: dict[str, Any] = {}
-            def receive() -> Any:
-                holder["value"], holder["spec"] = self.recv_forward_dynamic(device=device)
-                return holder["value"]
-            work = P2PWork(receive, "recv_forward_dynamic")
-        else:
-            self._validate_message_spec(spec, forward=True)
-            holder = {}
-            def receive() -> Any:
-                holder["value"] = self.recv_forward(spec)
-                return holder["value"]
-            work = P2PWork(receive, "recv_forward")
-        key = (self.pp_rank, int(spec.microbatch if spec is not None else (microbatch or 0)), "forward")
-        if key in self._posted: raise P2PError(f"duplicate preposted receive key={key}")
-        self._posted[key] = work; self._pending.append(work); return work
-
-    def post_recv_backward(self, spec: TensorSpec | None = None, *, device: Any | None = None,
-                           microbatch: int | None = None) -> P2PWork:
-        if spec is None:
-            if device is None: raise P2PError("post_recv_backward requires spec or device")
-            def receive() -> Any: return self.recv_backward_dynamic(device=device)[0]
-            work = P2PWork(receive, "recv_backward_dynamic")
-        else:
-            self._validate_message_spec(spec, forward=False)
-            work = P2PWork(lambda: self.recv_backward(spec), "recv_backward")
-        key = (self.pp_rank, int(spec.microbatch if spec is not None else (microbatch or 0)), "backward")
-        if key in self._posted: raise P2PError(f"duplicate preposted receive key={key}")
-        self._posted[key] = work; self._pending.append(work); return work
-
-    def wait_posted(self, *, direction: str, microbatch: int) -> Any:
-        """Wait for a previously posted receive.
-
-        No ``timeout`` argument: torch's ``Work.wait()`` has no timed variant, so a
-        per-call bound could only have been accepted and then ignored (which is what
-        this method used to do).  The operative bound is the process-group timeout
-        given to ``init_process_group``.
-        """
-        key = (self.pp_rank, int(microbatch), direction)
-        work = self._posted.pop(key, None)
-        if work is None: raise P2PError(f"missing or out-of-order posted receive key={key}")
-        work.wait()
-        return work.result
-
-    def send_forward_recv_forward(self, tensor: Any, *, spec: TensorSpec,
-                                  recv_spec: TensorSpec | None = None) -> tuple[P2PWork, Any]:
-        send = self.send_forward_async(tensor, spec=spec)
-        received = self.recv_forward(recv_spec) if recv_spec is not None else None
-        return send, received
-
-    def send_backward_recv_backward(self, grad: Any, *, spec: TensorSpec,
-                                    recv_spec: TensorSpec | None = None) -> tuple[P2PWork, Any]:
-        send = self.send_backward_async(grad, spec=spec)
-        received = self.recv_backward(recv_spec) if recv_spec is not None else None
-        return send, received
-
-    def send_forward_recv_backward(self, tensor: Any, spec: TensorSpec) -> Any:
-        self.send_forward(tensor, spec=spec)
-        backward = TensorSpec(spec.shape, spec.dtype, spec.device, spec.stage, spec.microbatch, "backward")
-        return self.recv_backward(backward)
-
-    def send_forward_recv_backward_async(self, tensor: Any, *, spec: TensorSpec,
-                                         backward_spec: TensorSpec | None = None) -> tuple[P2PWork, P2PWork | None]:
-        send = self.send_forward_async(tensor, spec=spec)
-        recv = self.post_recv_backward(backward_spec, device=spec.device,
-                                       microbatch=spec.microbatch) if backward_spec is not None else None
-        return send, recv
-
-    def send_backward_recv_forward(self, grad: Any, spec: TensorSpec) -> Any:
-        backward = TensorSpec(spec.shape, spec.dtype, spec.device, spec.stage, spec.microbatch, "backward")
-        self.send_backward(grad, spec=backward)
-        return self.recv_forward(spec)
-
-    def send_backward_recv_forward_async(self, grad: Any, *, spec: TensorSpec,
-                                         forward_spec: TensorSpec | None = None) -> tuple[P2PWork, P2PWork | None]:
-        backward = TensorSpec(spec.shape, spec.dtype, spec.device, spec.stage, spec.microbatch, "backward")
-        send = self.send_backward_async(grad, spec=backward)
-        recv = self.post_recv_forward(forward_spec, device=spec.device,
-                                      microbatch=spec.microbatch) if forward_spec is not None else None
-        return send, recv
-
     def drain(self) -> None:
         errors: list[BaseException] = []
         for work in reversed(self._pending):
@@ -250,7 +162,6 @@ class P2PCommunicator:
             except BaseException as exc:
                 errors.append(exc)
         self._pending.clear()
-        self._posted.clear()
         if errors:
             raise P2PError(f"failed to drain {len(errors)} pipeline P2P handles") from errors[0]
 

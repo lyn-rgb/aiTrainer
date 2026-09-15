@@ -49,7 +49,7 @@ layers = [
     "aitrainer.api | aitrainer.cli",
     # L4 — orchestration. Owns the ordering of everything below.
     # Non-independent (`:`): trainer reaches parallelizer for lazy parallelize().
-    "aitrainer.trainer : aitrainer.parallelizer : aitrainer.diagnostics : aitrainer.loading : aitrainer.model_spec",
+    "aitrainer.trainer : aitrainer.parallelizer : aitrainer.diagnostics : aitrainer.loading",
     # L3 — strategies built on the platform. These three do not import each other.
     "aitrainer.offload | aitrainer.plugins | aitrainer.planner",
     # L2 — the platform: process groups, collectives, PP, checkpoint I/O, async substrate.

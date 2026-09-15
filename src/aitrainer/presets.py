@@ -34,13 +34,13 @@ class ConfigPreset:
         (``cast_optimizer_state`` preserves the integer step counter).
 
         ``grad_dtype`` stays float32: the gradient/parameter dtype check
-        (``precision.cast_gradients``) requires them to match, and ``param_dtype``
-        is INERT -- parameter storage is controlled by
-        ``FSDPConfig.mixed_precision.dtype`` -- so a bf16 ``grad_dtype`` is
-        impossible to satisfy and made this preset raise on the first step.
+        (``precision.cast_gradients``) requires them to match, and parameter
+        storage is controlled by ``FSDPConfig.mixed_precision.dtype``, so a bf16
+        ``grad_dtype`` is impossible to satisfy and made this preset raise on the
+        first step.
         """
         return FrameworkConfig(precision=PrecisionConfig(
-            param_dtype="bfloat16", compute_dtype="bfloat16", grad_dtype="float32",
+            compute_dtype="bfloat16", grad_dtype="float32",
             reduce_dtype="bfloat16", optimizer_dtype="bfloat16"))
 
     @staticmethod
@@ -52,5 +52,5 @@ class ConfigPreset:
         ``optimizer_dtype`` (fp32 here, bf16 in ``memory_saving``).
         """
         return FrameworkConfig(precision=PrecisionConfig(
-            param_dtype="bfloat16", compute_dtype="bfloat16", grad_dtype="float32",
+            compute_dtype="bfloat16", grad_dtype="float32",
             reduce_dtype="bfloat16", optimizer_dtype="float32"))

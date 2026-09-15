@@ -18,7 +18,7 @@ from .distributed_model import DistributedModel
 from .runtime import Runtime
 from .offload import OffloadManager
 from .overlap import OverlapController
-from .precision import cast_gradients, validate_precision
+from .precision import autocast_context, cast_gradients, validate_precision
 
 logger = logging.getLogger("aitrainer")
 
@@ -119,12 +119,10 @@ class Trainer:
         self.history: list[StepOutput] = []
         self._data_provider: Any = None
         self.offload = OffloadManager(self.config.offload, overlap_config=self.config.overlap)
-        self.overlap = OverlapController(enabled=any((self.config.overlap.enable_tp_bulk_overlap,
-                                                     self.config.overlap.enable_gradient_bucket_overlap,
-                                                     self.config.overlap.enable_parameter_prefetch,
-                                                     self.config.overlap.enable_pp_p2p_overlap,
-                                                     self.config.overlap.enable_transfer_overlap)),
-                                         max_inflight_ops=self.config.overlap.max_inflight_ops,
+        # No `enabled=` flag: the five switches this used to fold together only
+        # fed a stored-and-never-read attribute, so the controller behaved
+        # identically either way.  The budgets below are the part that is read.
+        self.overlap = OverlapController(max_inflight_ops=self.config.overlap.max_inflight_ops,
                                          max_inflight_bytes=self.config.overlap.max_inflight_bytes)
         self.offload.register_model(self.model.module)
         self.offload.register_optimizer(self.optimizer)
@@ -175,15 +173,11 @@ class Trainer:
         return str(dtype).replace("torch.", "").lower()
 
     def _autocast(self):
-        torch = _import_torch()
-        name = self._dtype_name(self.config.precision.compute_dtype)
-        if self.device.type == "cuda" and name in {"float16", "bfloat16"}:
-            dtype = torch.float16 if name == "float16" else torch.bfloat16
-            try:
-                return torch.autocast(device_type="cuda", dtype=dtype)
-            except TypeError:
-                return torch.cuda.amp.autocast(dtype=dtype)
-        return torch.autocast(device_type="cpu", enabled=False)
+        # `precision.autocast_context` is the single implementation: this method
+        # used to be a second copy that mapped the dtype by hand and fell back to
+        # the deprecated `torch.cuda.amp.autocast`.  Keep the private name only
+        # because three call sites read it.
+        return autocast_context(self.config.precision, self.device)
 
     def _compute_loss(self, output: Any, batch: Any) -> Any:
         if self.loss_fn is not None:

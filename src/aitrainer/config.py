@@ -48,13 +48,13 @@ class PrecisionConfig:
     """Per-tensor-class dtypes.
 
     ``compute_dtype``, ``grad_dtype`` and ``optimizer_dtype`` are consumed by the
-    trainer.  ``reduce_dtype`` is threaded into the TP row projections.  Note that
-    ``param_dtype`` has NO consumer yet -- parameter storage dtype is currently
-    controlled by ``FSDPConfig.mixed_precision.dtype``; setting ``param_dtype``
-    silently has no effect.
+    trainer.  ``reduce_dtype`` is threaded into the TP row projections.
+
+    Parameter *storage* dtype is controlled by ``FSDPConfig.mixed_precision.dtype``;
+    there is deliberately no ``param_dtype`` here, because one used to exist with no
+    consumer at all and silently did nothing when set.
     """
 
-    param_dtype: Any = "float32"
     compute_dtype: Any = "float32"
     grad_dtype: Any = "float32"
     reduce_dtype: Any = "float32"
@@ -62,7 +62,7 @@ class PrecisionConfig:
     use_grad_scaler: bool | None = None
 
     def validate(self) -> None:
-        names = ("param_dtype", "compute_dtype", "grad_dtype", "reduce_dtype", "optimizer_dtype")
+        names = ("compute_dtype", "grad_dtype", "reduce_dtype", "optimizer_dtype")
         allowed = {"float32", "float16", "bfloat16"}
         for name in names:
             value = getattr(self, name)
@@ -74,10 +74,14 @@ class PrecisionConfig:
 
 @dataclass(frozen=True)
 class CompileConfig:
+    """``torch.compile`` is not implemented; ``enabled`` exists only to reject it.
+
+    ``mode``/``fullgraph``/``dynamic`` used to sit here, validated and documented
+    but read by nothing -- they are gone rather than left implying the feature is
+    configurable.
+    """
+
     enabled: bool = False
-    mode: str = "default"
-    fullgraph: bool = False
-    dynamic: bool = False
 
     def validate(self) -> None:
         if self.enabled:
@@ -167,8 +171,15 @@ class OffloadConfig:
 class AdvancedOverlapConfig:
     """Independent overlap switches and bounded in-flight resource budgets.
 
+    The ``enable_*`` switches are **rejection-only as of this version**: turning
+    one on does not turn the corresponding feature on, it only makes startup
+    reject combinations that genuinely cannot work (see
+    ``capability.validate_capabilities``).  They are kept deliberately -- removing
+    them would silently widen the set of accepted configurations, which is a
+    behaviour change disguised as cleanup.
+
     Byte budgets set to ``0`` mean automatic/unbounded for that optional class;
-    operation count and bucket size remain strictly positive safety limits.
+    operation count remains a strictly positive safety limit.
     """
     enable_tp_bulk_overlap: bool = False
     enable_gradient_bucket_overlap: bool = False
@@ -177,11 +188,9 @@ class AdvancedOverlapConfig:
     enable_pp_p2p_overlap: bool = False
     enable_transfer_overlap: bool = False
     enable_microbatch_interleave: bool = False
-    gradient_bucket_bytes: int = 25 * 1024 * 1024
     parameter_prefetch_bytes: int = 0
     max_inflight_ops: int = 2
     max_inflight_bytes: int = 0
-    max_prefetched_param_bytes: int = 0
     max_transfer_bytes: int = 0
     drain_timeout_s: float = 60.0
 
@@ -191,13 +200,13 @@ class AdvancedOverlapConfig:
                      "enable_microbatch_interleave"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"overlap.{name} must be bool")
-        for name in ("gradient_bucket_bytes", "parameter_prefetch_bytes", "max_inflight_ops", "max_inflight_bytes",
-                     "max_prefetched_param_bytes", "max_transfer_bytes"):
+        for name in ("parameter_prefetch_bytes", "max_inflight_ops", "max_inflight_bytes",
+                     "max_transfer_bytes"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ConfigurationError(f"overlap.{name} must be a non-negative integer")
-        if self.gradient_bucket_bytes < 1 or self.max_inflight_ops < 1:
-            raise ConfigurationError("overlap.gradient_bucket_bytes and max_inflight_ops must be positive")
+        if self.max_inflight_ops < 1:
+            raise ConfigurationError("overlap.max_inflight_ops must be positive")
         if self.drain_timeout_s < 0:
             raise ConfigurationError("overlap.drain_timeout_s must be non-negative")
 
@@ -222,18 +231,6 @@ class PlanningConfig:
 
 
 @dataclass(frozen=True)
-class CheckpointConfig:
-    interval: int = 0
-    keep_last: int | None = None
-
-    def validate(self) -> None:
-        if self.interval < 0:
-            raise ConfigurationError("checkpoint.interval must be >= 0")
-        if self.keep_last is not None and self.keep_last < 1:
-            raise ConfigurationError("checkpoint.keep_last must be >= 1 or None")
-
-
-@dataclass(frozen=True)
 class FrameworkConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
@@ -242,7 +239,6 @@ class FrameworkConfig:
     offload: OffloadConfig = field(default_factory=OffloadConfig)
     overlap: AdvancedOverlapConfig = field(default_factory=AdvancedOverlapConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
-    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     grad_accumulation_steps: int = 1
     grad_clip_norm: float | None = None
     seed: int = 42
@@ -263,7 +259,6 @@ class FrameworkConfig:
         self.offload.validate()
         self.overlap.validate()
         self.planning.validate()
-        self.checkpoint.validate()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -281,8 +276,7 @@ class FrameworkConfig:
         values = dict(data)
         for name, typ in (("parallel", ParallelConfig), ("precision", PrecisionConfig),
                           ("compile", CompileConfig), ("fsdp", FSDPConfig),
-                          ("offload", OffloadConfig), ("overlap", AdvancedOverlapConfig), ("planning", PlanningConfig),
-                          ("checkpoint", CheckpointConfig)):
+                          ("offload", OffloadConfig), ("overlap", AdvancedOverlapConfig), ("planning", PlanningConfig)):
             raw = values.get(name)
             if raw is None:
                 if name in values:

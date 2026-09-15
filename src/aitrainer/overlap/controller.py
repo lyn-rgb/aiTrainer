@@ -11,10 +11,10 @@ class OverlapRecord:
     overlapped_seconds: float = 0.0; bytes: int = 0; kind: str = "unknown"
 
 class OverlapController:
-    def __init__(self, scheduler: ExecutionScheduler | None = None, *, enabled: bool = False,
+    def __init__(self, scheduler: ExecutionScheduler | None = None,
                  max_inflight_ops: int = 2, max_inflight_bytes: int = 0,
                  budgets: Any | None = None) -> None:
-        self.scheduler = scheduler or ExecutionScheduler(); self.enabled = bool(enabled)
+        self.scheduler = scheduler or ExecutionScheduler()
         self.max_inflight_ops = max(1, int(max_inflight_ops)); self.max_inflight_bytes = max(0, int(max_inflight_bytes))
         self.records: list[OverlapRecord] = []; self._deps: dict[int, tuple[AsyncOp, ...]] = {}; self._ops: list[AsyncOp] = []
         self._frozen = False; self._plan: tuple[AsyncOp, ...] = (); self._budgets = budgets

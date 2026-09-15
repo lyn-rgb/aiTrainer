@@ -61,13 +61,11 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
         device_type=str(getattr(getattr(runtime, "state", None), "device", "cpu")).split(":", 1)[0],
     )
     coordinate = mesh.coordinate
-    stage_plan = None
     if config.parallel.pp_size > 1:
         policy = config.planning.stage_policy if config.planning.enabled else "uniform_layers"
-        stages, plans = split_sequential(model, config.parallel.pp_size, policy=policy)
+        stages = split_sequential(model, config.parallel.pp_size, policy=policy)[0]
         stage_id = coordinate.pp
         stage = stages[stage_id]
-        stage_plan = plans[stage_id]
     else:
         stage_id = 0
         stage = model
@@ -80,7 +78,7 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
     if config.fsdp.enabled:
         stage = wrap_fsdp(stage, runtime=runtime, mesh=mesh, config=config.fsdp)
     if config.parallel.pp_size > 1:
-        return PipelineStage(stage, stage_id=stage_id, stage_plan=stage_plan,
+        return PipelineStage(stage, stage_id=stage_id,
                              schedule=config.parallel.pp_schedule,
                              pp_group=mesh.pipeline_parallel_group,
                              pp_ranks=mesh.ranks("pp"),

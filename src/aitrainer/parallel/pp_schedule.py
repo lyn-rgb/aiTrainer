@@ -305,6 +305,3 @@ class OneFOneBSchedule(PipelineSchedule):
         self._backward_complete = True
         return ScheduleOutput(None, (), total, True)
 
-
-GPipe = GPipeSchedule
-OneFOneB = OneFOneBSchedule

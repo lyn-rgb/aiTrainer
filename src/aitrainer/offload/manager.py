@@ -73,12 +73,6 @@ class OffloadManager:
     def fetch(self, module: Any, *, device: Any | None = None) -> int:
         return self.parameter.fetch(module=module, device=device) if self.parameter is not None else 0
 
-    def prefetch(self, module: Any, *, device: Any | None = None) -> int:
-        return self.parameter.prefetch(module, device=device) if self.parameter is not None else 0
-
-    def prefetch_async(self, module: Any, *, device: Any | None = None) -> Any:
-        return self.parameter.prefetch_async(module, device=device) if self.parameter is not None else None
-
     def release(self, module: Any) -> int:
         return self.parameter.release(module=module) if self.parameter is not None else 0
 
