@@ -363,6 +363,71 @@ def _batch(step: int, index: int):
 
 
 # --------------------------------------------------------------------------- #
+# Pipeline parallelism -- the production path, at pp_size > 1
+# --------------------------------------------------------------------------- #
+@case("pp_pipeline_step")
+def pp_pipeline_step(rank: int, world: int, dist, options: dict) -> dict:
+    """Drive the real ``Trainer.fit`` through the PP path and compare to world 1.
+
+    Before this case existed, ``PipelineStage.pipeline_step`` and
+    ``_pipeline_step_1f1b`` had **never been executed at pp_size > 1 by any test
+    in the repository**: the only constructions of ``PipelineStage`` in tests
+    pass ``pp_size=1``, which takes the plain-module shortcut above the schedule.
+    The 17 in-process protocol tests cover ``parallel/pp_schedule.py``, which the
+    production path does not call.  So the two implementations had disjoint
+    coverage, and the one nothing covered was the one that runs.
+
+    The model is a 3-child ``nn.Sequential`` so that a pp_size=2 split lands one
+    Linear on each rank with the ReLU as the boundary.  Each rank reports its own
+    stage's parameters; the test concatenates them and compares against the
+    world_size=1 run of this same case, which reports the whole model.
+    """
+    import torch
+    from torch import nn
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    schedule = options.get("schedule", "gpipe")
+    accumulation = int(options.get("accumulation", "1"))
+    steps = int(options.get("steps", "3"))
+    pp_size = 2 if world > 1 else 1
+
+    torch.manual_seed(7)
+    module = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+    values: dict[str, object] = {"grad_accumulation_steps": accumulation}
+    if world > 1:
+        values["parallel"] = {"pp_size": pp_size, "pp_schedule": schedule,
+                              "num_microbatches": 2}
+    config = FrameworkConfig.from_dict(values)
+    runtime = Runtime(device="cpu", seed=7)
+    model = parallelize(module, config=config, runtime=runtime) if world > 1 else module
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = Trainer(model, optimizer, config=config, runtime=runtime)
+
+    trainer.fit([_classification_batch(step) for step in range(steps)], epochs=1)
+
+    # Each rank holds only its own stage; world_size==1 holds everything.
+    stage = model.module if hasattr(model, "module") else model
+    parameters = [value for parameter in stage.parameters()
+                  for value in parameter.detach().flatten().tolist()]
+    applied = [step.optimizer_step for step in trainer.history]
+    losses = None
+    if rank == world - 1:                 # only the last stage computes a loss
+        losses = [step.loss for step in trainer.history]
+    return {"rank": rank, "global_step": trainer.global_step, "applied": applied,
+            "optimizer_steps": sum(applied), "losses": losses,
+            "parameter_count": len(parameters), "parameters": parameters}
+
+
+def _classification_batch(step: int):
+    """A (features, int-labels) tuple batch: the tuple branch of the loss policy."""
+    import torch
+    generator = torch.Generator().manual_seed(2000 + step)
+    return torch.randn(4, 4, generator=generator), torch.randint(0, 4, (4,), generator=generator)
+
+
+# --------------------------------------------------------------------------- #
 def _tp_group(world: int, rank: int):
     from aitrainer.parallel.groups import ProcessGroups
     from aitrainer.topology import RankMapping
@@ -377,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--shape", default="2,2,1",
                         help="pp,dp,tp for the process-group cases")
+    parser.add_argument("--option", action="append", default=[], metavar="KEY=VALUE",
+                        help="case-specific option; repeatable")
     arguments = parser.parse_args(argv)
 
     import torch  # noqa: F401 - imported so a missing torch fails loudly here
@@ -386,7 +453,11 @@ def main(argv: list[str] | None = None) -> int:
     world = int(os.environ["WORLD_SIZE"])
     dist.init_process_group("gloo", timeout=timedelta(seconds=arguments.timeout_seconds))
     try:
-        result = CASES[arguments.case](rank, world, dist, {"shape": arguments.shape})
+        options = {"shape": arguments.shape}
+        for item in arguments.option:
+            key, _, value = item.partition("=")
+            options[key] = value
+        result = CASES[arguments.case](rank, world, dist, options)
         dist.barrier()
         print("RESULT " + json.dumps(result), flush=True)
     except Exception as exc:  # noqa: BLE001 - reported to the parent process

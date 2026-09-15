@@ -169,3 +169,56 @@ def test_trainer_fit_over_fsdp_matches_single_process():
         assert payload["applied"] == reference["applied"]
         assert payload["weight"] == reference["weight"], "FSDP replica diverged from the reference"
         assert payload["bias"] == reference["bias"]
+
+
+@pytest.mark.parametrize("schedule", ["gpipe", "1f1b"])
+def test_pipeline_production_path_matches_single_process(schedule):
+    """The PP path must produce, at pp_size=2, what one process produces alone.
+
+    This is the first test in the repository to execute
+    ``PipelineStage.pipeline_step`` / ``_pipeline_step_1f1b`` at ``pp_size > 1``.
+    Neither the 17 in-process protocol tests (they drive
+    ``parallel/pp_schedule.py``, which the production path does not call) nor any
+    other test reached these lines: every other ``PipelineStage`` construction
+    passes ``pp_size=1`` and takes the plain-module shortcut above the schedule.
+    That gap is why the pipeline consolidation is staged behind this case.
+
+    Each rank reports only its own stage's parameters, so the two are
+    concatenated before comparison -- that concatenation is also what checks the
+    stage split put the right layers on the right rank.
+    """
+    reference = require_success(run_case("pp_pipeline_step", 1,
+                                         options={"schedule": schedule},
+                                         hard_timeout=120.0))[0]
+    replicas = require_success(run_case("pp_pipeline_step", 2,
+                                        options={"schedule": schedule},
+                                        hard_timeout=120.0))
+    assert len(replicas) == 2
+    joined = replicas[0]["parameters"] + replicas[1]["parameters"]
+    assert len(joined) == len(reference["parameters"]), "the two stages must partition the model"
+    assert joined == reference["parameters"], "pipeline parameters diverged from single-process"
+    assert replicas[1]["losses"] == reference["losses"], "last-stage loss diverged"
+    assert all(payload["global_step"] == reference["global_step"] for payload in replicas)
+
+
+def test_pipeline_accumulation_drops_the_trailing_window():
+    """A trailing partial window must be dropped on the PP path too.
+
+    ``fit``'s epilogue was the site of a real regression on the non-pipeline path
+    (a flush stepped on gradients accumulated under ``no_sync`` and never
+    reduced).  This checks the same contract holds when ``pipeline_step`` owns
+    the backward.
+    """
+    options = {"schedule": "gpipe", "accumulation": "3", "steps": "7"}
+    reference = require_success(run_case("pp_pipeline_step", 1, options=options,
+                                         hard_timeout=120.0))[0]
+    assert reference["applied"] == [False, False, True, False, False, True, False], (
+        "only the microbatch closing a window may step")
+    assert reference["optimizer_steps"] == 2, "the trailing partial window must be dropped"
+
+    replicas = require_success(run_case("pp_pipeline_step", 2, options=options,
+                                        hard_timeout=120.0))
+    for payload in replicas:
+        assert payload["applied"] == reference["applied"]
+    joined = replicas[0]["parameters"] + replicas[1]["parameters"]
+    assert joined == reference["parameters"], "accumulated pipeline weights diverged"

@@ -93,6 +93,7 @@ def _parse(stdout: str) -> dict | None:
 
 
 def run_case(case: str, world_size: int, *, shape: str | None = None,
+             options: dict[str, str] | None = None,
              timeout_seconds: float = 30.0,
              hard_timeout: float = 120.0) -> list[RankResult]:
     """Run ``case`` on ``world_size`` processes and return every rank's result.
@@ -101,16 +102,17 @@ def run_case(case: str, world_size: int, *, shape: str | None = None,
     collision would otherwise surface as a red gate that passes on re-run.
     Cases that *expect* a timeout are unaffected -- see ``_RENDEZVOUS_FAILURES``.
     """
-    results = _run_once(case, world_size, shape=shape, timeout_seconds=timeout_seconds,
-                        hard_timeout=hard_timeout)
+    results = _run_once(case, world_size, shape=shape, options=options,
+                        timeout_seconds=timeout_seconds, hard_timeout=hard_timeout)
     if _rendezvous_failed(results):
-        results = _run_once(case, world_size, shape=shape, timeout_seconds=timeout_seconds,
-                            hard_timeout=hard_timeout)
+        results = _run_once(case, world_size, shape=shape, options=options,
+                            timeout_seconds=timeout_seconds, hard_timeout=hard_timeout)
     return results
 
 
 def _run_once(case: str, world_size: int, *, shape: str | None,
-              timeout_seconds: float, hard_timeout: float) -> list[RankResult]:
+              options: dict[str, str] | None, timeout_seconds: float,
+              hard_timeout: float) -> list[RankResult]:
     environment = dict(os.environ)
     environment.update({
         "MASTER_ADDR": "127.0.0.1",
@@ -127,6 +129,8 @@ def _run_once(case: str, world_size: int, *, shape: str | None,
                    "--timeout-seconds", str(timeout_seconds)]
         if shape is not None:
             command += ["--shape", shape]
+        for key, value in sorted((options or {}).items()):
+            command += ["--option", f"{key}={value}"]
         processes.append(subprocess.Popen(
             command, cwd=str(REPO_ROOT), env=rank_environment,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
