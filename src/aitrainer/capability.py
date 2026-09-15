@@ -114,10 +114,16 @@ def capability_matrix() -> tuple[Capability, ...]:
     )
 
 
-def validate_capabilities(config: FrameworkConfig, *, world_size: int = 1,
+def validate_combinations(config: FrameworkConfig, *, world_size: int = 1,
                           torch_module: object | None = None) -> None:
-    """Validate requested features before model construction."""
-    config.validate(world_size=world_size)
+    """Cross-configuration rules only.
+
+    Each config class owns its own invariants (``FrameworkConfig.validate``);
+    this owns the rules that span siblings -- "dp_size>1 requires FSDP",
+    "microbatch interleave rejects PP", and so on.  Kept separate so an entry
+    point that has already validated the config does not validate it twice;
+    :func:`validate_capabilities` is the version that does both.
+    """
     # DP is a real training dimension only when FSDP owns that group.  TP and
     # PP may be combined with one another and with FSDP because their groups
     # are constructed orthogonally by DeviceMeshManager.
@@ -148,6 +154,20 @@ def validate_capabilities(config: FrameworkConfig, *, world_size: int = 1,
     # CPU bfloat16 is legal for many operators, so it is deliberately NOT rejected
     # globally.  (An earlier version ended with a branch that computed this and
     # then returned without doing anything; removed rather than left as a decoy.)
+
+
+def validate_capabilities(config: FrameworkConfig, *, world_size: int = 1,
+                          torch_module: object | None = None) -> None:
+    """The public validation entry point: invariants, then combinations.
+
+    Every entry point that accepts a config should call this one.  It used to be
+    that ``Trainer.__init__`` called ``config.validate`` and then called this,
+    which called ``config.validate`` again -- so the same config was checked
+    twice on every construction, and ``parallelize`` made it three times on the
+    ``from_model`` path.
+    """
+    config.validate(world_size=world_size)
+    validate_combinations(config, world_size=world_size, torch_module=torch_module)
 
 
 def installed_optional_backends() -> dict[str, bool]:

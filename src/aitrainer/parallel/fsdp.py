@@ -66,8 +66,16 @@ class FSDPWrapper:
             if mixed is not None:
                 kwargs["mixed_precision"] = mixed
             kwargs["limit_all_gathers"] = bool(getattr(config, "limit_all_gathers", True))
-            kwargs["forward_prefetch"] = bool(getattr(config, "forward_prefetch", False) and
-                                               getattr(config, "execution_trace_complete", False))
+            forward_prefetch = bool(getattr(config, "forward_prefetch", False))
+            if forward_prefetch and not bool(getattr(config, "execution_trace_complete", False)):
+                # `config.py` already rejects this combination, so reaching here
+                # means the caller bypassed config validation.  Silently ANDing
+                # the flag away turned "prefetch was refused" into "prefetch is
+                # off", which is a different thing to report to the user.
+                raise FSDPConfigurationError(
+                    "fsdp.forward_prefetch requires execution_trace_complete=True; "
+                    "dynamic execution must not enable prefetch")
+            kwargs["forward_prefetch"] = forward_prefetch
         self.module = FSDP(module, **kwargs)
         self._fsdp = FSDP
         self._torch = torch

@@ -42,11 +42,12 @@ class Trainer:
         torch = require_torch("aiTrainer training requires PyTorch; install the project's torch dependency")
         self.config = config or FrameworkConfig()
         self.runtime = runtime or Runtime(device=device or self.config.device, seed=self.config.seed)
-        self.config.validate(world_size=self.runtime.world_size)
         # Capability gating must not depend on the entry point.  Trainer.from_model
         # routes through parallelize() (which validates), but constructing a Trainer
         # directly skipped it -- so FSDP + gradient-bucket overlap was accepted
         # silently here while dry_run/from_model rejected the same config.
+        # validate_capabilities runs config.validate itself, so the separate call
+        # that used to sit above this line only validated everything twice.
         validate_capabilities(self.config, world_size=self.runtime.world_size, torch_module=torch)
         if self.runtime.world_size > 1 and self.config.parallel.dp_size > 1:
             # Only REPLICATED ranks need to reduce gradients together.  TP/PP with

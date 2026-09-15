@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any, Literal
 
-from .core.dtypes import dtype_name
-
-
-class ConfigurationError(ValueError):
-    """Raised when a configuration cannot be safely executed."""
+from ..core.dtypes import dtype_name
+from .codec import instantiate
+from .errors import ConfigurationError
 
 
 @dataclass(frozen=True)
@@ -283,28 +281,9 @@ class FrameworkConfig:
             raw = values.get(name)
             if raw is None:
                 if name in values:
-                    # `{"parallel": null}` used to crash later with a bare
-                    # AttributeError on None.dp_size.
                     raise ConfigurationError(f"{name} must be an object, not null")
                 continue
-            if is_dataclass(raw):
-                continue
-            if not isinstance(raw, Mapping):
-                raise ConfigurationError(f"{name} must be an object")
-            try:
-                if name == "fsdp" and isinstance(raw.get("mixed_precision"), Mapping):
-                    raw = dict(raw)
-                    raw["mixed_precision"] = MixedPrecisionConfig(**raw["mixed_precision"])
-                values[name] = typ(**raw)
-            except ConfigurationError:
-                raise
-            except TypeError as exc:
-                # A typo'd nested key surfaced as `ParallelConfig.__init__() got
-                # an unexpected keyword argument 'tp_sizee'`, leaking the class
-                # name and bypassing `except ConfigurationError` handlers.
-                raise ConfigurationError(f"{name} has an unknown or invalid field: {exc}") from exc
-            except ValueError as exc:
-                raise ConfigurationError(f"invalid {name} configuration: {exc}") from exc
+            values[name] = instantiate(typ, raw, name)
         result = cls(**values)
         # Configuration parsing happens before Runtime knows the launched
         # world size. Validate structural constraints against the declared
