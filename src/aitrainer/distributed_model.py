@@ -126,8 +126,6 @@ class PipelineStage:
         the copies are gone, so the 17 in-process protocol tests now guard the
         code that actually runs.
         """
-        import torch
-
         if self.pp_size <= 1:
             output = call_with_inputs(self.module, batch)
             loss = compute_loss(output, batch, loss_fn)
