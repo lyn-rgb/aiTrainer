@@ -64,6 +64,35 @@ layers = [
 ]
 
 # Empty, and it stays that way: the one entry it used to carry --
-# `aitrainer.data -> aitrainer.parallel.pp_shapes` -- was removed in stage 3 by
-# moving the batch conventions into aitrainer.core.batching.
+# `aitrainer.data -> aitrainer.parallel.pp_shapes` -- was removed by moving the
+# batch conventions into aitrainer.core.batching.  New violations are fixed, not
+# added here.
 ignore_imports = []
+
+[[tool.importlinter.contracts]]
+name = "core is a leaf"
+type = "forbidden"
+source_modules = ["aitrainer.core"]
+forbidden_modules = [
+    "aitrainer.adapters", "aitrainer.api", "aitrainer.capability", "aitrainer.checkpoint",
+    "aitrainer.cli", "aitrainer.config", "aitrainer.data", "aitrainer.diagnostics",
+    "aitrainer.distributed_model", "aitrainer.kernels", "aitrainer.loading", "aitrainer.memory",
+    "aitrainer.mesh", "aitrainer.metrics", "aitrainer.offload", "aitrainer.overlap",
+    "aitrainer.parallel", "aitrainer.parallelizer", "aitrainer.planner", "aitrainer.plugins",
+    "aitrainer.precision", "aitrainer.presets", "aitrainer.profiler", "aitrainer.runtime",
+    "aitrainer.topology", "aitrainer.trainer",
+]
+
+[[tool.importlinter.contracts]]
+name = "plugins reach parallel only through the model-integration surface"
+type = "forbidden"
+# Direct imports only.  `parallel.tp` is allowed and itself imports
+# `parallel.collectives`, so a transitive check would forbid an edge that
+# plugins neither write nor can avoid.
+allow_indirect_imports = true
+source_modules = ["aitrainer.plugins"]
+forbidden_modules = [
+    "aitrainer.parallel.fsdp", "aitrainer.parallel.groups", "aitrainer.parallel.pp_p2p",
+    "aitrainer.parallel.pp_schedule", "aitrainer.parallel.sp_sequence",
+    "aitrainer.parallel.sp_ulysses",
+]

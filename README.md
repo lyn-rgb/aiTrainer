@@ -1,10 +1,15 @@
 # aiTrainer
 
-aiTrainer is a small, model-agnostic PyTorch training foundation. Batch 0
-provides immutable configuration, adapter protocols, a reproducible single
-process trainer, portable checkpoints, and a manifest-based model-loading
-contract. Later batches add explicit FSDP, TP, SP, PP, offload, checkpoint,
-planner, and profiling interfaces with conservative capability boundaries.
+aiTrainer is a small, model-agnostic PyTorch training foundation: immutable
+configuration, adapter protocols, a reproducible trainer, portable checkpoints,
+and explicit FSDP / TP / SP / PP / offload interfaces with conservative
+capability boundaries.
+
+**Architecture**: see [`docs/架构.md`](docs/架构.md) for the layered module map
+and the dependency contracts that are machine-checked in CI. The design
+documents (`docs/路线图.md`, `docs/开发方案与开发规划.md`) describe a *target*
+state, not the code as it stands; `docs/代码审计报告.md` records the defect
+history and what was verified empirically.
 
 ```bash
 pip install -e .
