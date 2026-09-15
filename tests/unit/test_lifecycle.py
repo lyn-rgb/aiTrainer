@@ -9,7 +9,7 @@ disappear with the file that happened to host them.
 
 import pytest
 
-from aitrainer.lifecycle import AsyncOp, ExecutionScheduler, LifecycleError
+from aitrainer.core.lifecycle import AsyncOp, ExecutionScheduler, LifecycleError
 
 
 def test_scheduler_drains_registered_operations():

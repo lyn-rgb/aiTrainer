@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
+from ..core.tensors import tensor_bytes
 from ..memory import BufferKey, PinnedBufferPool
 
 
@@ -55,7 +57,7 @@ class ActivationOffloader:
             return False
         if str(tensor.device) == "cpu" or id(tensor) in self._parameter_ids or id(tensor) in self._buffer_ids:
             return False
-        if int(tensor.numel()) * int(tensor.element_size()) <= self.threshold_bytes:
+        if tensor_bytes(tensor) <= self.threshold_bytes:
             return False
         if getattr(tensor, "_base", None) is not None:
             return False
@@ -76,7 +78,7 @@ class ActivationOffloader:
                 record.pooled = True
             else:
                 if self.pool is not None:
-                    record.external_reserved = int(tensor.numel()) * int(tensor.element_size())
+                    record.external_reserved = tensor_bytes(tensor)
                     self.pool.reserve_external(record.external_reserved)
                 cpu = torch.empty_strided(shape, stride, dtype=tensor.dtype, device="cpu", pin_memory=want_pin)
             cpu.copy_(tensor.detach(), non_blocking=want_pin)

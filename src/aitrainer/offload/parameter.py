@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
+from ..core.tensors import tensor_bytes
 from ..memory import BufferKey, PinnedBufferPool
 from ..overlap.parameter import ParameterPrefetchCoordinator
 
@@ -117,7 +119,7 @@ class ParameterOffloader:
         # A module-level operation keeps the complete parameter set alive until
         # the consumer explicitly waits; the coordinator owns the handle.
         key = "module:" + str(id(module))
-        op = self.trace.fetch(key, bytes_=sum(int(getattr(p, "numel", lambda: 0)()) * _itemsize(p) for p in _parameters(module)))
+        op = self.trace.fetch(key, bytes_=sum(tensor_bytes(p) for p in _parameters(module)))
         if op is None:
             return None
         op.handle = fetch_module
@@ -152,7 +154,7 @@ class ParameterOffloader:
         return moved
 
     def stats(self) -> dict[str, int | bool]:
-        cpu_bytes = sum(int(getattr(r.master, "numel", lambda: 0)()) * _itemsize(r.master) for r in self._records.values())
+        cpu_bytes = sum(tensor_bytes(r.master) for r in self._records.values())
         return {"parameters": len(self._records), "cpu_bytes": cpu_bytes,
                 "fetched": sum(r.fetched for r in self._records.values())}
 
@@ -163,8 +165,3 @@ class ParameterOffloader:
             for record in self._records.values():
                 self.pool.release(record.master)
         self._records.clear(); self._module_ids.clear()
-
-
-def _itemsize(tensor: Any) -> int:
-    value = getattr(tensor, "element_size", None)
-    return int(value()) if callable(value) else 4

@@ -5,9 +5,13 @@ rejects pipeline, dynamic-microbatch and activation-offload combinations until
 those contracts can be proven equivalent.
 """
 from __future__ import annotations
+
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
-from ..lifecycle import AsyncOp, ExecutionScheduler, LifecycleError
+from typing import Any
+
+from ..core.lifecycle import AsyncOp, ExecutionScheduler
+
 
 @dataclass(frozen=True)
 class MicrobatchResult:

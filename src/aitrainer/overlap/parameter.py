@@ -1,9 +1,14 @@
 """Trace-driven parameter prefetch coordinator with safe invalidation fallback."""
 from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable
 from dataclasses import dataclass
-import hashlib, json
-from typing import Any, Callable
-from ..lifecycle import AsyncOp, ExecutionScheduler
+from typing import Any
+
+from ..core.lifecycle import AsyncOp, ExecutionScheduler
+
 
 @dataclass(frozen=True)
 class TraceFingerprint:

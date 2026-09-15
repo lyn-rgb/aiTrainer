@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from dataclasses import dataclass
 import logging
 import os
 import warnings
-from typing import Any, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Any
 
 from .adapters import DataProvider, LossFn
 from .capability import validate_capabilities
-from .config import FrameworkConfig
-from .data import TARGET_KEYS, model_inputs
 from .checkpoint.manager import CheckpointManager
+from .config import FrameworkConfig
+from .core.batching import compute_loss, model_inputs
+from .core.tensors import move_to
 from .distributed_model import DistributedModel
-from .runtime import Runtime
 from .offload import OffloadManager
 from .overlap import OverlapController
 from .precision import autocast_context, cast_gradients, validate_precision
+from .runtime import Runtime
 
 logger = logging.getLogger("aitrainer")
 
@@ -37,18 +39,6 @@ def _import_torch() -> Any:
     except ImportError as exc:
         raise ImportError("aiTrainer training requires PyTorch; install the project's torch dependency") from exc
     return torch
-
-
-def _move(value: Any, device: Any) -> Any:
-    if hasattr(value, "to"):
-        return value.to(device)
-    if isinstance(value, Mapping):
-        return {key: _move(item, device) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_move(item, device) for item in value)
-    if isinstance(value, list):
-        return [_move(item, device) for item in value]
-    return value
 
 
 class Trainer:
@@ -133,7 +123,7 @@ class Trainer:
                    optimizer_cls: Any | None = None, optimizer_kwargs: Mapping[str, Any] | None = None,
                    loss_fn: LossFn | Callable[[Any, Any], Any] | None = None,
                    scheduler: Any | None = None, device: str | None = None,
-                   runtime: Runtime | None = None) -> "Trainer":
+                   runtime: Runtime | None = None) -> Trainer:
         """Build a trainer from a model or adapter without hiding parallel choices."""
         model = model_or_adapter
         runtime_obj = runtime
@@ -180,32 +170,8 @@ class Trainer:
         return autocast_context(self.config.precision, self.device)
 
     def _compute_loss(self, output: Any, batch: Any) -> Any:
-        if self.loss_fn is not None:
-            return self.loss_fn(output, batch)
-        if isinstance(output, Mapping) and "loss" in output:
-            return output["loss"]
-        if hasattr(output, "loss"):
-            return output.loss
-        logits = output["logits"] if isinstance(output, Mapping) and "logits" in output else output
-        labels = None
-        if isinstance(batch, Mapping):
-            # Read the same target keys model_inputs strips, so the strip-set and
-            # the read-set cannot disagree (a batch using "target" used to raise
-            # even though the error message promised a Mapping carrying labels).
-            for key in TARGET_KEYS:
-                if key in batch:
-                    labels = batch[key]
-                    break
-        elif isinstance(batch, (tuple, list)) and len(batch) >= 2:
-            labels = batch[1]
-        if labels is None:
-            raise TypeError(
-                "loss_fn is required unless the model output contains 'loss' or the batch carries "
-                "labels (a Mapping with 'labels', or a tuple whose second element is the target)"
-            )
-        # Flatten sequence dims so [N, T, C] logits pair with [N, T] labels.
-        return _import_torch().nn.functional.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
+        # One implementation, shared with the pipeline paths (see core.batching).
+        return compute_loss(output, batch, self.loss_fn)
 
     def _optimizer_step_block(self) -> float | None:
         """Unscale, cast, clip, step, and advance bookkeeping for one update.
@@ -256,7 +222,7 @@ class Trainer:
     def _pipeline_train_step(self, batch: Any) -> StepOutput:
         """Run a PP-owned backward step and update the stage optimizer once."""
         torch = _import_torch()
-        batch = _move(batch, self.device)
+        batch = move_to(batch, self.device)
         will_step = (self.global_step + 1) % self.config.grad_accumulation_steps == 0
         sync_context = nullcontext() if will_step else self.model.no_sync()
         self.offload.fetch(self.model.module, device=self.device)
@@ -284,7 +250,7 @@ class Trainer:
         self.model.train()
         if bool(getattr(self.model.module, "uses_pipeline", False)):
             return self._pipeline_train_step(batch)
-        batch = _move(batch, self.device)
+        batch = move_to(batch, self.device)
         # no_sync() must span forward AND backward: FSDP's all-gather and DDP's
         # reduction hooks are installed during forward.  Skipping it made every
         # microbatch pay a full gradient reduction instead of one per
@@ -368,7 +334,7 @@ class Trainer:
         self.model.eval()
         with torch.no_grad():
             for batch in loader:
-                batch = _move(batch, self.device)
+                batch = move_to(batch, self.device)
                 if bool(getattr(self.model.module, "uses_pipeline", False)):
                     result = self.model.module.pipeline_evaluate(batch, loss_fn=self.loss_fn)
                     value = result.get("loss")

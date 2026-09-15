@@ -1,7 +1,10 @@
 """Bounded in-flight resource accounting."""
 from __future__ import annotations
+
 from dataclasses import dataclass
-from ..lifecycle import AsyncOp, AsyncState, LifecycleError
+
+from ..core.lifecycle import AsyncOp, AsyncState, LifecycleError
+
 
 @dataclass(frozen=True)
 class ResourceBudget:

@@ -429,7 +429,7 @@ def test_from_dict_reports_configuration_errors_not_raw_exceptions(payload):
 def test_overlap_budget_bounds_inflight_ops():
     """_enforce_budget waited the oldest op but never released it, so the same
     already-WAITED op was re-waited forever and neither budget ever blocked again."""
-    from aitrainer.lifecycle import AsyncOp
+    from aitrainer.core.lifecycle import AsyncOp
     from aitrainer.overlap.controller import OverlapController
 
     controller = OverlapController(max_inflight_ops=2)
@@ -519,7 +519,7 @@ def test_released_without_completing_is_not_a_silent_success():
     """release() is legal from TIMED_OUT, and re-waiting used to return None."""
     import time
 
-    from aitrainer.lifecycle import AsyncOp, LifecycleError
+    from aitrainer.core.lifecycle import AsyncOp, LifecycleError
 
     op = AsyncOp("slow", _wait_fn=lambda _: time.sleep(0.3))
     op.submit()
@@ -555,7 +555,7 @@ def test_eager_fallback_is_selected_and_not_registerable():
 
 def test_overlap_peak_is_a_concurrency_high_water_mark():
     """inflight_peak reported the number of recorded operations, not a peak."""
-    from aitrainer.lifecycle import AsyncOp
+    from aitrainer.core.lifecycle import AsyncOp
     from aitrainer.overlap.controller import OverlapController
     from aitrainer.overlap.metrics import OverlapMetrics
 

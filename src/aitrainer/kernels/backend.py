@@ -7,9 +7,12 @@ structured record so callers can persist which implementation actually ran.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
+
+from ..core.dtypes import dtype_name
 
 
 class KernelStatus(str, Enum):
@@ -69,7 +72,7 @@ class KernelBackend:
 
     @staticmethod
     def _name(value: Any) -> str:
-        return str(value).replace("torch.", "").lower()
+        return dtype_name(value)
 
     def select(self, *, device: Any = "cpu", dtype: Any = "float32", layout: str = "contiguous",
                shape: tuple[int, ...] | None = None, backend: str | None = None,

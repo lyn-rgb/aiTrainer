@@ -7,10 +7,13 @@ transfer lifetimes explicit and avoids a module-level allocator.
 
 from __future__ import annotations
 
-from collections import defaultdict
-from dataclasses import dataclass
 import math
-from typing import Any, Callable
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from ..core.dtypes import dtype_name, dtype_size
 
 
 class BufferPoolError(RuntimeError):
@@ -38,7 +41,7 @@ class BufferKey:
 
     @property
     def nbytes(self) -> int:
-        return self.numel * _dtype_size(self.dtype)
+        return self.numel * dtype_size(self.dtype)
 
 
 @dataclass
@@ -47,25 +50,6 @@ class _Entry:
     tensor: Any
     nbytes: int
     in_use: bool = True
-
-
-def _dtype_size(dtype: Any) -> int:
-    """Best-effort dtype size without importing torch at module import time."""
-    if isinstance(dtype, str):
-        name = dtype.lower().replace("torch.", "")
-        return {"bool": 1, "uint8": 1, "int8": 1, "float8_e4m3fn": 1,
-                "float8_e5m2": 1, "int16": 2, "float16": 2, "bfloat16": 2,
-                "int32": 4, "float32": 4, "int64": 8, "float64": 8}.get(name, 4)
-    itemsize = getattr(dtype, "itemsize", None)
-    if isinstance(itemsize, int) and itemsize > 0:
-        return itemsize
-    name = str(dtype).lower()
-    for token, size in (("float64", 8), ("int64", 8), ("float32", 4), ("int32", 4),
-                        ("float16", 2), ("bfloat16", 2), ("int16", 2), ("bool", 1),
-                        ("uint8", 1), ("int8", 1)):
-        if token in name:
-            return size
-    return 4
 
 
 class PinnedBufferPool:
@@ -101,7 +85,7 @@ class PinnedBufferPool:
             raise BufferPoolError("PyTorch is required to allocate offload buffers") from exc
         dtype = key.dtype
         if isinstance(dtype, str):
-            name = dtype.replace("torch.", "")
+            name = dtype_name(dtype)
             if not hasattr(torch, name):
                 raise BufferPoolError(f"unsupported buffer dtype {dtype!r}")
             dtype = getattr(torch, name)
@@ -138,7 +122,7 @@ class PinnedBufferPool:
         # Charge what was ACTUALLY allocated.  Clamping down to the requested size
         # made an oversized allocation (the old strided path allocated ~1000x the
         # quota) look free to the next admission check.
-        actual = int(getattr(tensor, "numel", lambda: key.numel)()) * _dtype_size(getattr(tensor, "dtype", key.dtype))
+        actual = int(getattr(tensor, "numel", lambda: key.numel)()) * dtype_size(getattr(tensor, "dtype", key.dtype))
         entry = _Entry(key, tensor, actual)
         self._entries[id(tensor)] = entry
         self._allocated_bytes += actual

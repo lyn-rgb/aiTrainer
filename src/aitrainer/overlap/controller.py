@@ -1,9 +1,13 @@
 """Frozen dependency plan and unified drain controller."""
 from __future__ import annotations
-from dataclasses import dataclass
+
 import time
-from typing import Any, Callable
-from ..lifecycle import AsyncOp, AsyncState, ExecutionScheduler, LifecycleError
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from ..core.lifecycle import AsyncOp, AsyncState, ExecutionScheduler, LifecycleError
+
 
 @dataclass(frozen=True)
 class OverlapRecord:

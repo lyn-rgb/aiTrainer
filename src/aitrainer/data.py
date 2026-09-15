@@ -2,38 +2,35 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any
 
-from .parallel.pp_shapes import split_microbatches
+from .core.batching import (
+    TARGET_KEYS,
+    model_inputs,
+    split_microbatches,
+    target_of,
+)
+
+# The batch conventions themselves live in ``core.batching``; they are
+# re-exported here because this module is where callers have always found them.
+# Without this list ruff reads the import as unused and deletes it, which is
+# exactly what happened once already.
+__all__ = [
+    "TARGET_KEYS",
+    "BatchContract",
+    "BatchMetadata",
+    "DataContractError",
+    "StatefulSampler",
+    "model_inputs",
+    "split_microbatches",
+    "target_of",
+]
 
 
 class DataContractError(ValueError):
     """Raised when a batch violates the declared training data contract."""
-
-
-# Keys that carry supervision, never model inputs.  They belong to the loss.
-TARGET_KEYS: tuple[str, ...] = ("labels", "target", "targets")
-
-
-def model_inputs(batch: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Split a batch into the args a ``forward`` should receive.
-
-    Supervision is excluded so a model never has to accept ``labels`` just to be
-    trainable: a tuple batch contributes only its first element, and a Mapping
-    contributes every key except :data:`TARGET_KEYS`.  ``loss_fn`` (or the
-    trainer's label fallback) still receives the whole batch.
-
-    Edge case: a Mapping holding ONLY target keys has no inputs to forward, so it
-    is passed through unchanged rather than emptied (an empty call would be worse).
-    Such a batch is a caller error -- there is nothing for the model to consume.
-    """
-    if isinstance(batch, Mapping):
-        values = {key: value for key, value in batch.items() if key not in TARGET_KEYS}
-        return (), (values if values else dict(batch))
-    if isinstance(batch, (tuple, list)):
-        return ((batch[0],) if batch else ()), {}
-    return (batch,), {}
 
 
 @dataclass(frozen=True)

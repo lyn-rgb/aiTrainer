@@ -4,23 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..core.tensors import map_tensors, tensor_bytes
 from ..memory import PinnedBufferPool
 
 
 class OptimizerOffloadError(RuntimeError):
     """Raised when optimizer state cannot be moved safely."""
-
-
-def _map_tensors(value: Any, fn: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _map_tensors(item, fn) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_map_tensors(item, fn) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_map_tensors(item, fn) for item in value)
-    if hasattr(value, "is_floating_point") and hasattr(value, "to"):
-        return fn(value)
-    return value
 
 
 class CPUOptimizerStateOffloader:
@@ -70,7 +59,7 @@ class CPUOptimizerStateOffloader:
                         self.pool.release_external(reserved)
                     return result
                 return tensor
-            opt.state[parameter] = _map_tensors(state, move)
+            opt.state[parameter] = map_tensors(state, move)
         self._on_cpu = False
         return moved
 
@@ -82,7 +71,7 @@ class CPUOptimizerStateOffloader:
                 nonlocal moved
                 if getattr(tensor, "device", None) is not None and str(tensor.device) != "cpu":
                     moved += int(getattr(tensor, "numel", lambda: 0)())
-                    nbytes = int(tensor.numel()) * int(tensor.element_size())
+                    nbytes = tensor_bytes(tensor)
                     if self.pool is not None:
                         self.pool.reserve_external(nbytes)
                     try:
@@ -94,11 +83,11 @@ class CPUOptimizerStateOffloader:
                     self._reservations[id(result)] = nbytes
                     return result
                 if self.pool is not None and id(tensor) not in self._reservations:
-                    nbytes = int(tensor.numel()) * int(tensor.element_size())
+                    nbytes = tensor_bytes(tensor)
                     self.pool.reserve_external(nbytes)
                     self._reservations[id(tensor)] = nbytes
                 return tensor
-            opt.state[parameter] = _map_tensors(state, move)
+            opt.state[parameter] = map_tensors(state, move)
         self._on_cpu = True
         return moved
 

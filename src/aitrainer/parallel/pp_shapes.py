@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
+from ..core.batching import (
+    BatchContractError as PipelineShapeError,
+)
+from ..core.batching import (
+    normalize_loss,
+    split_microbatches,
+)
 
-class PipelineShapeError(ValueError):
-    """Raised when a pipeline tensor or stage plan is inconsistent."""
+# `normalize_loss` and `split_microbatches` now live in core.batching; they are
+# re-exported here because this module is where callers have always imported
+# them from.  The list is load-bearing: without it ruff reads the imports as
+# unused and deletes them.
+__all__ = ["PipelineShapeError", "StagePlan", "TensorSpec", "normalize_loss",
+           "plan_stages", "split_microbatches", "split_sequential"]
 
 
 @dataclass(frozen=True)
@@ -26,7 +38,7 @@ class TensorSpec:
             raise PipelineShapeError("stage, microbatch and tag must be explicit")
 
     @classmethod
-    def from_tensor(cls, tensor: Any, *, stage: int, microbatch: int, tag: str) -> "TensorSpec":
+    def from_tensor(cls, tensor: Any, *, stage: int, microbatch: int, tag: str) -> TensorSpec:
         return cls(tuple(tensor.shape), tensor.dtype, tensor.device, stage, microbatch, tag)
 
     def validate_tensor(self, tensor: Any) -> None:
@@ -98,43 +110,8 @@ def plan_stages(layers: Sequence[Any], pp_size: int, *, policy: str = "uniform_l
 def split_sequential(module: Any, pp_size: int, *, policy: str = "uniform_layers",
                      sample: Any = None) -> tuple[Any, tuple[StagePlan, ...]]:
     """Split a module with an ordered ``children()`` contract into stages."""
-    import torch.nn as nn
+    from torch import nn
     layers = list(module.children())
     plans = plan_stages(layers, pp_size, policy=policy, sample=sample)
     stages = tuple(nn.Sequential(*layers[p.start:p.stop]) for p in plans)
     return stages, plans
-
-
-def split_microbatches(batch: Any, count: int, *, batch_dim: int = 0) -> list[Any]:
-    """Split tensor/mapping/tuple batches evenly without changing their contract."""
-    if count < 1:
-        raise PipelineShapeError("microbatch count must be positive")
-    if hasattr(batch, "shape") and hasattr(batch, "split"):
-        size = batch.shape[batch_dim]
-        if size % count:
-            raise PipelineShapeError(f"batch dimension {size} is not divisible by microbatches={count}")
-        return list(batch.split(size // count, dim=batch_dim))
-    if isinstance(batch, Mapping):
-        parts = {key: split_microbatches(value, count, batch_dim=batch_dim) if hasattr(value, "shape") else [value] * count
-                 for key, value in batch.items()}
-        return [{key: values[index] for key, values in parts.items()} for index in range(count)]
-    if isinstance(batch, tuple):
-        parts = [split_microbatches(value, count, batch_dim=batch_dim) if hasattr(value, "shape") else [value] * count
-                 for value in batch]
-        return [tuple(values[index] for values in parts) for index in range(count)]
-    if isinstance(batch, list):
-        parts = [split_microbatches(value, count, batch_dim=batch_dim) if hasattr(value, "shape") else [value] * count
-                 for value in batch]
-        return [[values[index] for values in parts] for index in range(count)]
-    raise PipelineShapeError(f"cannot split batch type {type(batch).__name__}")
-
-
-def normalize_loss(loss: Any, *, valid_tokens: int | None = None) -> Any:
-    """Normalize a scalar or token-summed loss exactly once."""
-    if not hasattr(loss, "ndim") or loss.ndim != 0:
-        raise PipelineShapeError("pipeline loss must be scalar")
-    if valid_tokens is not None:
-        if valid_tokens < 1:
-            raise PipelineShapeError("valid_tokens must be positive")
-        return loss / valid_tokens
-    return loss

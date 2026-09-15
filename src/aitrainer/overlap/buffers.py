@@ -1,8 +1,11 @@
 """Generation checked ping-pong leases for temporary communication buffers."""
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any
-from ..lifecycle import AsyncOp, AsyncState, LifecycleError
+
+from ..core.lifecycle import AsyncOp, AsyncState, LifecycleError
+
 
 @dataclass
 class BufferLease:

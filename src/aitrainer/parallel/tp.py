@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..core.torch import rank as _core_rank
+from ..core.torch import world_size as _core_world_size
+
 try:
     from torch import nn
     _ModuleBase = nn.Module
@@ -16,19 +19,6 @@ except ImportError:
 
 class TPConfigurationError(ValueError):
     """Raised when a TP dimension or layout contract is invalid."""
-
-
-def _world_size(group: Any) -> int:
-    try:
-        import torch.distributed as dist
-        return dist.get_world_size(group) if dist.is_initialized() else 1
-    except ImportError:
-        return 1
-
-
-def _rank(group: Any) -> int:
-    import torch.distributed as dist
-    return dist.get_rank(group) if dist.is_initialized() else 0
 
 
 def _require_divisible(value: int, world: int, name: str) -> int:
@@ -51,8 +41,8 @@ class ColumnParallelLinear(_ModuleBase):
         self.input_size, self.output_size = input_size, output_size
         self.process_group = process_group
         self.overlap_controller = overlap_controller
-        self.tp_size = _world_size(process_group)
-        self.tp_rank = _rank(process_group) if self.tp_size > 1 else 0
+        self.tp_size = _core_world_size(process_group)
+        self.tp_rank = _core_rank(process_group) if self.tp_size > 1 else 0
         self.output_size_per_partition = _require_divisible(output_size, self.tp_size, "output_size")
         self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, input_size))
         self.bias = nn.Parameter(torch.empty(self.output_size_per_partition)) if bias else None
@@ -61,7 +51,6 @@ class ColumnParallelLinear(_ModuleBase):
         self.reset_parameters(init_method)
 
     def reset_parameters(self, init_method: Any = None) -> None:
-        import torch
         if init_method is not None:
             init_method(self.weight)
         else:
@@ -72,6 +61,7 @@ class ColumnParallelLinear(_ModuleBase):
 
     def forward(self, value: Any, *, input_is_parallel: bool = False) -> Any:
         import torch
+
         from .collectives import copy_to_tp, gather_from_tp
         if not input_is_parallel:
             if self.overlap_controller is not None:
@@ -103,11 +93,11 @@ class ColumnParallelLinear(_ModuleBase):
                 "tp_size": self.tp_size}
 
     @classmethod
-    def from_dense(cls, dense: Any, *, process_group: Any = None, **kwargs: Any) -> "ColumnParallelLinear":
+    def from_dense(cls, dense: Any, *, process_group: Any = None, **kwargs: Any) -> ColumnParallelLinear:
         import torch
         layer = cls(dense.in_features, dense.out_features, bias=dense.bias is not None,
                     process_group=process_group, **kwargs)
-        rank = _rank(process_group) if _world_size(process_group) > 1 else 0
+        rank = _core_rank(process_group) if _core_world_size(process_group) > 1 else 0
         start = rank * layer.output_size_per_partition
         with torch.no_grad():
             layer.weight.copy_(dense.weight[start:start + layer.output_size_per_partition])
@@ -130,8 +120,8 @@ class RowParallelLinear(_ModuleBase):
         self.input_size, self.output_size = input_size, output_size
         self.process_group = process_group
         self.overlap_controller = overlap_controller
-        self.tp_size = _world_size(process_group)
-        self.tp_rank = _rank(process_group) if self.tp_size > 1 else 0
+        self.tp_size = _core_world_size(process_group)
+        self.tp_rank = _core_rank(process_group) if self.tp_size > 1 else 0
         self.input_size_per_partition = _require_divisible(input_size, self.tp_size, "input_size")
         self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition))
         self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
@@ -151,6 +141,7 @@ class RowParallelLinear(_ModuleBase):
 
     def forward(self, value: Any, *, input_is_parallel: bool | None = None) -> Any:
         import torch
+
         from .collectives import reduce_from_tp, scatter_to_tp
         is_parallel = self.input_is_parallel if input_is_parallel is None else input_is_parallel
         if not is_parallel:
@@ -170,11 +161,11 @@ class RowParallelLinear(_ModuleBase):
                 "tp_size": self.tp_size}
 
     @classmethod
-    def from_dense(cls, dense: Any, *, process_group: Any = None, **kwargs: Any) -> "RowParallelLinear":
+    def from_dense(cls, dense: Any, *, process_group: Any = None, **kwargs: Any) -> RowParallelLinear:
         import torch
         layer = cls(dense.in_features, dense.out_features, bias=dense.bias is not None,
                     process_group=process_group, **kwargs)
-        rank = _rank(process_group) if _world_size(process_group) > 1 else 0
+        rank = _core_rank(process_group) if _core_world_size(process_group) > 1 else 0
         start = rank * layer.input_size_per_partition
         with torch.no_grad():
             layer.weight.copy_(dense.weight[:, start:start + layer.input_size_per_partition])

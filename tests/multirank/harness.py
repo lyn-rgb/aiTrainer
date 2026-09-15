@@ -43,9 +43,46 @@ class RankResult:
 
 
 def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    """A port that was free a moment ago, verified across several attempts.
+
+    Binding to port 0 and closing hands the port straight back to the kernel's
+    ephemeral pool, so a following attempt can receive it again.  Each candidate
+    is re-bound to check it, which is not a proof -- nothing is, short of holding
+    the socket -- but it makes an accidental collision rare.  A collision used to
+    surface as a red gate that passed on re-run.
+    """
+    for _ in range(20):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+        if port < 20000:          # avoid the low range other tools squat on
+            continue
+        with socket.socket() as verify:
+            verify.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                verify.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("could not find a free port for the rendezvous")
+
+
+# A rendezvous that never completed is an infrastructure failure, not a result.
+# It is textually distinct from what the negative controls look for: a store
+# *barrier* timeout after a successful rendezvous reports
+# "wait timeout after Nms, keys: ...", while these report a connection that was
+# never established.  Retrying only the former keeps the deadlock controls honest.
+_RENDEZVOUS_FAILURES = (
+    "waiting for clients",
+    "client socket has timed out",
+    "Address already in use",
+    "Address in use",
+)
+
+
+def _rendezvous_failed(results: list["RankResult"]) -> bool:
+    combined = " ".join((result.error or "") + result.stderr for result in results)
+    return any(marker in combined for marker in _RENDEZVOUS_FAILURES)
 
 
 def _parse(stdout: str) -> dict | None:
@@ -58,7 +95,22 @@ def _parse(stdout: str) -> dict | None:
 def run_case(case: str, world_size: int, *, shape: str | None = None,
              timeout_seconds: float = 30.0,
              hard_timeout: float = 120.0) -> list[RankResult]:
-    """Run ``case`` on ``world_size`` processes and return every rank's result."""
+    """Run ``case`` on ``world_size`` processes and return every rank's result.
+
+    A rendezvous that never came up is retried once, because a transient port
+    collision would otherwise surface as a red gate that passes on re-run.
+    Cases that *expect* a timeout are unaffected -- see ``_RENDEZVOUS_FAILURES``.
+    """
+    results = _run_once(case, world_size, shape=shape, timeout_seconds=timeout_seconds,
+                        hard_timeout=hard_timeout)
+    if _rendezvous_failed(results):
+        results = _run_once(case, world_size, shape=shape, timeout_seconds=timeout_seconds,
+                            hard_timeout=hard_timeout)
+    return results
+
+
+def _run_once(case: str, world_size: int, *, shape: str | None,
+              timeout_seconds: float, hard_timeout: float) -> list[RankResult]:
     environment = dict(os.environ)
     environment.update({
         "MASTER_ADDR": "127.0.0.1",

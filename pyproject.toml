@@ -58,11 +58,12 @@ layers = [
     "aitrainer.parallel : aitrainer.mesh : aitrainer.checkpoint : aitrainer.overlap : aitrainer.memory : aitrainer.runtime : aitrainer.distributed_model",
     # L1 — declarations: config, contracts, capability registry, hardware description.
     # Non-independent: capability/presets/precision build on config.
-    "aitrainer.config : aitrainer.capability : aitrainer.precision : aitrainer.data : aitrainer.topology : aitrainer.presets : aitrainer.metrics : aitrainer.profiler : aitrainer.kernels : aitrainer.lifecycle : aitrainer.adapters",
+    "aitrainer.config : aitrainer.capability : aitrainer.precision : aitrainer.data : aitrainer.topology : aitrainer.presets : aitrainer.metrics : aitrainer.profiler : aitrainer.kernels : aitrainer.adapters",
+    # L0 — the leaf layer. Nothing here imports anything else in aitrainer.
+    "aitrainer.core",
 ]
-ignore_imports = [
-    # `data` needs `split_microbatches` from the parallel layer. Both this edge
-    # and the reciprocal `parallel.pp_schedule -> data` are resolved by moving
-    # the batch conventions into `aitrainer.core.batching` (refactor Stage 3).
-    "aitrainer.data -> aitrainer.parallel.pp_shapes",
-]
+
+# Empty, and it stays that way: the one entry it used to carry --
+# `aitrainer.data -> aitrainer.parallel.pp_shapes` -- was removed in stage 3 by
+# moving the batch conventions into aitrainer.core.batching.
+ignore_imports = []

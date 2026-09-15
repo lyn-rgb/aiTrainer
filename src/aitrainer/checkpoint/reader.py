@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..core.tensors import tensor_bytes
 from .format import Manifest, ModelLoadConfig, file_checksum, load_manifest
 
 
@@ -42,7 +43,7 @@ class ModelLoader:
         except Exception as exc:
             raise RuntimeError(f"failed to load rank-local DCP state from {path}") from exc
         tensors = sum(1 for value in state.values() if hasattr(value, "numel"))
-        bytes_read = sum(int(value.numel() * value.element_size()) for value in state.values()
+        bytes_read = sum(tensor_bytes(value) for value in state.values()
                          if hasattr(value, "numel"))
         return {"tensors_loaded": tensors, "bytes_read": bytes_read}
 
@@ -159,5 +160,5 @@ class ModelLoader:
                                          f"target={tuple(target.shape)}")
                     target.copy_(value)
                     loaded += 1
-                    bytes_read += value.numel() * value.element_size()
+                    bytes_read += tensor_bytes(value)
         return {"tensors_loaded": loaded, "bytes_read": bytes_read}

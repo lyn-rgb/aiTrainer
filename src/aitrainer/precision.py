@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any, Iterable
+from typing import Any
 
 from .config import PrecisionConfig
+from .core.dtypes import dtype_name
 
 
 class PrecisionError(ValueError):
@@ -23,7 +25,7 @@ def resolve_dtype(dtype: Any, torch_module: Any | None = None) -> Any:
                 return dtype
             raise PrecisionError("PyTorch is required to resolve dtype objects") from exc
     if isinstance(dtype, str):
-        name = dtype.replace("torch.", "")
+        name = dtype_name(dtype)
         if not hasattr(torch, name):
             raise PrecisionError(f"unsupported dtype {dtype!r}")
         return getattr(torch, name)
@@ -44,7 +46,7 @@ def autocast_context(config: PrecisionConfig, device: Any, *, enabled: bool = Tr
         raise PrecisionError("PyTorch is required for autocast") from exc
     if not enabled:
         return nullcontext()
-    name = str(config.compute_dtype).replace("torch.", "").lower()
+    name = dtype_name(config.compute_dtype)
     device_name = str(getattr(device, "type", device)).split(":", 1)[0]
     if device_name == "cuda" and name in {"float16", "bfloat16"}:
         dtype = resolve_dtype(name, torch)
@@ -87,8 +89,8 @@ def cast_optimizer_state(optimizer: Any, dtype: Any, *, torch_module: Any | None
                 # that assert on the step tensor's dtype.
                 continue
             if hasattr(value, "dtype") and hasattr(value, "to"):
-                name = str(value.dtype).replace("torch.", "")
-                target_name = str(resolved).replace("torch.", "")
+                name = dtype_name(value.dtype)
+                target_name = dtype_name(resolved)
                 if name.startswith(("float", "bfloat")) and name != target_name:
                     state[key] = value.to(dtype=resolved)
                     changed += int(value.numel())

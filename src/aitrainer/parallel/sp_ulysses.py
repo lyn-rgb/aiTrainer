@@ -4,19 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..core.torch import world_size as _core_world_size
 from .collectives import all_to_all_layout
 
 
 class SPConfigurationError(ValueError):
     """Raised for invalid sequence/head partition shapes."""
-
-
-def _world_size(group: Any) -> int:
-    try:
-        import torch.distributed as dist
-        return dist.get_world_size(group) if dist.is_initialized() else 1
-    except ImportError:
-        return 1
 
 
 def pad_sequence(value: Any, seq_lens: Any, *, multiple: int, dim: int = 1,
@@ -75,7 +68,7 @@ def apply_rope(value: Any, cos: Any, sin: Any, *, position_offset: int = 0) -> A
 
 def ulysses_exchange(value: Any, *, group: Any = None, scatter_dim: int,
                      gather_dim: int) -> Any:
-    world = _world_size(group)
+    world = _core_world_size(group)
     if value.shape[scatter_dim] % world:
         raise SPConfigurationError(
             f"dimension {value.shape[scatter_dim]} is not divisible by SP world size {world}")
@@ -94,7 +87,7 @@ def distributed_attention(q: Any, k: Any, v: Any, *, group: Any = None,
     :func:`unpad_sequence` to recover each sample without losing metadata.
     """
     import torch
-    world = _world_size(group)
+    world = _core_world_size(group)
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise SPConfigurationError("Ulysses attention expects rank-4 [B,L,H,D] tensors")
     if q.shape != k.shape or q.shape != v.shape:

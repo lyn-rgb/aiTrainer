@@ -4,17 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..lifecycle import AsyncOp, ExecutionScheduler
-
-
-def _dist_world_size(group: Any = None) -> int:
-    try:
-        import torch.distributed as dist
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_world_size(group)
-    except ImportError:
-        return 1
-    return 1
+from ..core.torch import world_size as _core_world_size
 
 
 def _normalize_dim(dim: int, ndim: int) -> int:
@@ -35,59 +25,9 @@ def all_reduce_gradient(value: Any, group: Any = None) -> Any:
     Used for parameters that are REPLICATED across the group but whose gradients
     are computed from a local shard of the data -- without this, each copy drifts.
     """
-    if _dist_world_size(group) > 1:
+    if _core_world_size(group) > 1:
         _all_reduce(value, group)
     return value
-
-
-def _async_or_sync(name: str, handle: Any, *, scheduler: ExecutionScheduler | None = None,
-                   tensor: Any = None, group: Any = None, bytes_: int = 0) -> AsyncOp:
-    """Wrap a torch.distributed Work handle without ever dropping it.
-
-    ``handle`` may be ``None`` for CPU/Gloo or an unavailable async backend;
-    the returned operation still follows the same lifecycle and can be drained.
-    """
-    op = AsyncOp(name=name, handle=handle, tensor=tensor, group=group, bytes=bytes_).submit()
-    target = scheduler or ExecutionScheduler()
-    target.register(op)
-    return op
-
-
-def all_reduce_async(value: Any, group: Any = None, *, scheduler: ExecutionScheduler | None = None,
-                     op: Any = None) -> AsyncOp:
-    import torch.distributed as dist
-    if _dist_world_size(group) == 1:
-        return _async_or_sync("all_reduce", None, scheduler=scheduler, tensor=value, group=group,
-                              bytes_=int(getattr(value, "numel", lambda: 0)()) * int(getattr(value, "element_size", lambda: 1)()))
-    kwargs = {"group": group, "async_op": True}
-    if op is not None: kwargs["op"] = op
-    work = dist.all_reduce(value, **kwargs)
-    return _async_or_sync("all_reduce", work, scheduler=scheduler, tensor=value, group=group,
-                          bytes_=int(value.numel()) * int(value.element_size()))
-
-
-def all_gather_async(outputs: list[Any], value: Any, group: Any = None, *,
-                     scheduler: ExecutionScheduler | None = None) -> AsyncOp:
-    import torch.distributed as dist
-    if _dist_world_size(group) == 1:
-        outputs[0].copy_(value)
-        return _async_or_sync("all_gather", None, scheduler=scheduler, tensor=value, group=group,
-                              bytes_=int(value.numel()) * int(value.element_size()))
-    work = dist.all_gather(outputs, value.contiguous(), group=group, async_op=True)
-    return _async_or_sync("all_gather", work, scheduler=scheduler, tensor=value, group=group,
-                          bytes_=sum(int(x.numel()) * int(x.element_size()) for x in outputs))
-
-
-def reduce_scatter_async(output: Any, inputs: list[Any], group: Any = None, *,
-                         scheduler: ExecutionScheduler | None = None) -> AsyncOp:
-    import torch.distributed as dist
-    if _dist_world_size(group) == 1:
-        output.copy_(inputs[0])
-        return _async_or_sync("reduce_scatter", None, scheduler=scheduler, tensor=output, group=group,
-                              bytes_=int(output.numel()) * int(output.element_size()))
-    work = dist.reduce_scatter(output, inputs, group=group, async_op=True)
-    return _async_or_sync("reduce_scatter", work, scheduler=scheduler, tensor=output, group=group,
-                          bytes_=int(output.numel()) * int(output.element_size()) * len(inputs))
 
 
 class _CopyToTP:
@@ -102,7 +42,7 @@ class _CopyToTP:
 
             @staticmethod
             def backward(ctx: Any, grad: Any) -> tuple[Any, None]:
-                if _dist_world_size(ctx.group) > 1:
+                if _core_world_size(ctx.group) > 1:
                     grad = grad.contiguous().clone()
                     _all_reduce(grad, ctx.group)
                 return grad, None
@@ -117,7 +57,7 @@ class _ReduceFromTP:
             @staticmethod
             def forward(ctx: Any, x: Any, reduce_dtype: Any) -> Any:
                 ctx.group, ctx.input_dtype = group, x.dtype
-                if _dist_world_size(group) > 1:
+                if _core_world_size(group) > 1:
                     reduced = x.contiguous().clone()
                     if reduce_dtype is not None:
                         acc_dtype = reduce_dtype
@@ -145,11 +85,11 @@ class _Scatter:
             @staticmethod
             def forward(ctx: Any, x: Any, dim: int, group: Any) -> Any:
                 ctx.dim, ctx.group = dim, group
-                if _dist_world_size(group) == 1:
+                if _core_world_size(group) == 1:
                     return x
                 d = _normalize_dim(dim, x.ndim)
                 size = x.shape[d]
-                world = _dist_world_size(group)
+                world = _core_world_size(group)
                 if size % world:
                     raise ValueError(f"dimension {size} is not divisible by TP world size {world}")
                 chunks = x.chunk(world, dim=d)
@@ -180,7 +120,7 @@ class _Gather:
 
 
 def _gather_impl(value: Any, dim: int, group: Any) -> Any:
-    world = _dist_world_size(group)
+    world = _core_world_size(group)
     if world == 1:
         return value
     import torch
@@ -192,7 +132,7 @@ def _gather_impl(value: Any, dim: int, group: Any) -> Any:
 
 
 def _scatter_impl(value: Any, dim: int, group: Any) -> Any:
-    world = _dist_world_size(group)
+    world = _core_world_size(group)
     if world == 1:
         return value
     d = _normalize_dim(dim, value.ndim)
@@ -246,7 +186,7 @@ def all_to_all_layout(value: Any, *, scatter_dim: int, gather_dim: int, group: A
 
 
 def _all_to_all_impl(value: Any, scatter_dim: int, gather_dim: int, group: Any) -> Any:
-    world = _dist_world_size(group)
+    world = _core_world_size(group)
     if world == 1:
         return value
     import torch

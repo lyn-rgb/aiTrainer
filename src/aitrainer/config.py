@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
+
+from .core.dtypes import dtype_name
 
 
 class ConfigurationError(ValueError):
@@ -100,7 +103,7 @@ class MixedPrecisionConfig:
             raise ConfigurationError("fsdp.mixed_precision.enabled must be bool")
         dtype = self.dtype
         if isinstance(dtype, str):
-            if dtype.replace("torch.", "") not in {"float16", "bfloat16", "float32"}:
+            if dtype_name(dtype) not in {"float16", "bfloat16", "float32"}:
                 # Previously unvalidated: a garbage dtype reached FSDP and failed
                 # deep inside torch (or silently mis-cast).
                 raise ConfigurationError(f"fsdp.mixed_precision.dtype={dtype!r} is not supported")
@@ -263,12 +266,12 @@ class FrameworkConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def replace(self, **changes: Any) -> "FrameworkConfig":
+    def replace(self, **changes: Any) -> FrameworkConfig:
         """Return a new config; nested fields can be replaced explicitly."""
         return replace(self, **changes)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "FrameworkConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> FrameworkConfig:
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:

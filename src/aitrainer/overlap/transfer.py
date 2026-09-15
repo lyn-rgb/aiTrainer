@@ -1,8 +1,12 @@
 """Unified bounded H2D/D2H transfer scheduler with synchronous fallback."""
 from __future__ import annotations
-from typing import Any, Callable
-from ..lifecycle import AsyncOp, ExecutionScheduler
+
+from collections.abc import Callable
+from typing import Any
+
+from ..core.lifecycle import AsyncOp, ExecutionScheduler
 from .backpressure import Backpressure, ResourceBudget
+
 
 class TransferScheduler:
     def __init__(self, *, enabled: bool = False, max_transfer_bytes: int = 0, scheduler: ExecutionScheduler | None = None) -> None:

@@ -7,8 +7,11 @@ must never be folded into the FSDP group.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any, Iterable
+from typing import Any
+
+from ..core.dtypes import dtype_name
 
 
 class FSDPConfigurationError(ValueError):
@@ -26,9 +29,9 @@ def fsdp_available() -> bool:
 def _mixed_precision(config: Any) -> Any:
     if not getattr(config, "enabled", False):
         return None
-    from torch.distributed.fsdp import MixedPrecision
     import torch
-    dtype = getattr(torch, str(config.dtype).replace("torch.", ""), config.dtype)
+    from torch.distributed.fsdp import MixedPrecision
+    dtype = getattr(torch, dtype_name(config.dtype), config.dtype)
     return MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
 
 
@@ -39,7 +42,8 @@ class FSDPWrapper:
                  config: Any = None, auto_wrap_policy: Any = None) -> None:
         try:
             import torch
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import ShardingStrategy
         except ImportError as exc:
             raise FSDPConfigurationError("PyTorch FSDP is unavailable") from exc
         if config is not None:
@@ -74,15 +78,15 @@ class FSDPWrapper:
     def parameters(self, recurse: bool = True) -> Iterable[Any]:
         return self.module.parameters(recurse=recurse)
 
-    def train(self, mode: bool = True) -> "FSDPWrapper":
+    def train(self, mode: bool = True) -> FSDPWrapper:
         self.module.train(mode)
         return self
 
-    def to(self, *args: Any, **kwargs: Any) -> "FSDPWrapper":
+    def to(self, *args: Any, **kwargs: Any) -> FSDPWrapper:
         self.module.to(*args, **kwargs)
         return self
 
-    def eval(self) -> "FSDPWrapper":
+    def eval(self) -> FSDPWrapper:
         return self.train(False)
 
     def no_sync(self):

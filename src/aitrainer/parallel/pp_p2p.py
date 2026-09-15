@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..core.dtypes import dtype_name
 from .pp_shapes import TensorSpec
 
 
@@ -167,7 +168,7 @@ class P2PCommunicator:
 
     @staticmethod
     def _dtype_code(dtype: Any) -> int:
-        name = str(dtype).replace("torch.", "")
+        name = dtype_name(dtype)
         table = {"float32": 1, "float16": 2, "bfloat16": 3, "float64": 4,
                  "int64": 5, "int32": 6, "bool": 7}
         if name not in table:

@@ -1,9 +1,12 @@
 """Backward-ready gradient buckets with accumulation and sync fallback."""
 from __future__ import annotations
+
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
-from .buffers import PingPongBuffer
-from ..lifecycle import AsyncOp, ExecutionScheduler
+from typing import Any
+
+from ..core.lifecycle import AsyncOp, ExecutionScheduler
+
 
 @dataclass
 class GradientBucket:

@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from typing import Any
 
 from ..config import OffloadConfig
-from ..lifecycle import ExecutionScheduler
+from ..core.lifecycle import ExecutionScheduler
 from ..memory import PinnedBufferPool
 from ..overlap.transfer import TransferScheduler
 from .activation import ActivationOffloader

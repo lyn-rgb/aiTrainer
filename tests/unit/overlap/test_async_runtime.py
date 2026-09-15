@@ -1,4 +1,4 @@
-from aitrainer.lifecycle import AsyncOp, AsyncState, ExecutionScheduler, LifecycleError
+from aitrainer.core.lifecycle import AsyncOp, AsyncState, ExecutionScheduler
 from aitrainer.overlap import Backpressure, GradientBucket, PingPongBuffer, ResourceBudget
 
 
