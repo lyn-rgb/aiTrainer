@@ -87,3 +87,22 @@ def rank(group: Any = None) -> int:
     if not is_distributed():
         return 0
     return int(dist().get_rank(group))
+
+
+def module_base() -> tuple[Any, Any]:
+    """``(base class, torch.nn or None)`` for classes that must import without torch.
+
+    Lets a module define ``class Foo(ModuleBase)`` at import time on a machine
+    with no torch, while still raising a clear error if the class is actually
+    instantiated there.  Two modules grew their own copy of this dance; the shape
+    is identical every time, so it lives with the rest of the optional-torch
+    policy.
+    """
+    try:
+        from torch import nn
+    except ImportError:
+        class _Placeholder:
+            """Stand-in base so the class definition itself never needs torch."""
+            __slots__ = ()
+        return _Placeholder, None
+    return nn.Module, nn

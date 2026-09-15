@@ -18,7 +18,7 @@ from ..offload import OffloadManager
 from ..overlap import OverlapController
 from ..precision import autocast_context, validate_precision
 from ..runtime import Runtime
-from . import checkpointing, evaluation, loop, step
+from . import bootstrap, checkpointing, evaluation, loop, step
 from .state import StepOutput
 
 logger = logging.getLogger("aitrainer")
@@ -109,36 +109,10 @@ class Trainer:
                    scheduler: Any | None = None, device: str | None = None,
                    runtime: Runtime | None = None) -> Trainer:
         """Build a trainer from a model or adapter without hiding parallel choices."""
-        model = model_or_adapter
-        runtime_obj = runtime
-        requested_parallel = bool(config is not None and (
-            config.fsdp.enabled or config.parallel.dp_size > 1 or
-            config.parallel.tp_size > 1 or config.parallel.pp_size > 1))
-        # Create the runtime -- and therefore apply the seed -- BEFORE the model
-        # is built.  Building first drew weight init from the ambient unseeded
-        # RNG, so `seed` never made initialisation reproducible.
-        if runtime_obj is None and config is not None:
-            runtime_obj = Runtime(device=device or config.device, seed=config.seed)
-        if hasattr(model_or_adapter, "build") and not hasattr(model_or_adapter, "parameters"):
-            build_device = device or (config.device if config is not None else "auto")
-            if build_device == "auto":
-                build_device = "cpu"
-            model = model_or_adapter.build(device=build_device)
-        if requested_parallel:
-            if optimizer is not None:
-                raise ValueError("pass an optimizer factory/class when automatic parallel wrapping is enabled")
-            from .parallelizer import parallelize
-            model = parallelize(model, config=config, runtime=runtime_obj)
-        if optimizer is not None and (optimizer_factory is not None or optimizer_cls is not None):
-            raise ValueError("pass only one of optimizer, optimizer_factory, or optimizer_cls")
-        if optimizer is None and optimizer_factory is not None:
-            optimizer = optimizer_factory(model.parameters()) if callable(optimizer_factory) else optimizer_factory.build(model.parameters())
-        if optimizer is None:
-            torch = require_torch("aiTrainer training requires PyTorch; install the project's torch dependency")
-            cls_optimizer = optimizer_cls or torch.optim.AdamW
-            kwargs = dict(optimizer_kwargs or {})
-            kwargs.setdefault("lr", 1e-3)
-            optimizer = cls_optimizer(model.parameters(), **kwargs)
+        model, optimizer, runtime_obj = bootstrap.prepare(
+            model_or_adapter, config=config, optimizer=optimizer,
+            optimizer_factory=optimizer_factory, optimizer_cls=optimizer_cls,
+            optimizer_kwargs=optimizer_kwargs, device=device, runtime=runtime)
         return cls(model, optimizer, config=config, loss_fn=loss_fn, scheduler=scheduler,
                    device=device, runtime=runtime_obj)
 

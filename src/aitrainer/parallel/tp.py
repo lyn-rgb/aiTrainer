@@ -4,17 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..core.torch import module_base
 from ..core.torch import rank as _core_rank
 from ..core.torch import world_size as _core_world_size
 
-try:
-    from torch import nn
-    _ModuleBase = nn.Module
-except ImportError:
-    nn = None  # type: ignore[assignment]
-    class _ModuleBase:  # type: ignore[no-redef]
-        """Import-time placeholder when optional torch dependency is absent."""
-        __slots__ = ()
+ModuleBase, nn = module_base()
 
 
 class TPConfigurationError(ValueError):
@@ -27,7 +21,7 @@ def _require_divisible(value: int, world: int, name: str) -> int:
     return value // world
 
 
-class ColumnParallelLinear(_ModuleBase):
+class ColumnParallelLinear(ModuleBase):
     """Linear layer with output dimension partitioned across the TP group."""
 
     def __init__(self, input_size: int, output_size: int, *, bias: bool = True,
@@ -106,7 +100,7 @@ class ColumnParallelLinear(_ModuleBase):
         return layer
 
 
-class RowParallelLinear(_ModuleBase):
+class RowParallelLinear(ModuleBase):
     """Linear layer with input dimension partitioned across the TP group."""
 
     def __init__(self, input_size: int, output_size: int, *, bias: bool = True,

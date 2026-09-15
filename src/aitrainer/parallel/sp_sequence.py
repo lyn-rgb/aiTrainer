@@ -4,15 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-try:
-    from torch import nn
-    _ModuleBase = nn.Module
-except ImportError:
-    nn = None  # type: ignore[assignment]
-    class _ModuleBase:
-        __slots__ = ()
-
+from ..core.torch import module_base
 from .collectives import all_reduce_gradient, gather_from_sequence, scatter_to_sequence
+
+# Must be an expression at import time: the classes below inherit from it.
+ModuleBase, nn = module_base()
 
 
 def scatter_sequence(value: Any, group: Any = None, *, dim: int = 1) -> Any:
@@ -23,7 +19,7 @@ def gather_sequence(value: Any, group: Any = None, *, dim: int = 1) -> Any:
     return gather_from_sequence(value, group, dim=dim)
 
 
-class SequenceParallelLayerNorm(_ModuleBase):
+class SequenceParallelLayerNorm(ModuleBase):
     """LayerNorm over hidden features while sequence is sharded across TP ranks."""
 
     def __init__(self, normalized_shape: Any, *, eps: float = 1e-5,
