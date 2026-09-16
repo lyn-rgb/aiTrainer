@@ -1192,6 +1192,66 @@ def interior_pipeline_stage_trains(rank: int, world: int, dist, options: dict) -
             "backward_complete": bool(getattr(result, "backward_complete", False))}
 
 
+@case("pipeline_checkpoint_resume")
+def pipeline_checkpoint_resume(rank: int, world: int, dist, options: dict) -> dict:
+    """Save a sharded checkpoint on a pipeline and resume into a second trainer.
+
+    The step after the load is the assertion.  On a two-stage pipeline with
+    SGD+momentum, ``load_sharded`` used to return successfully while rank 0's
+    optimizer group came back without ``dampening``/``lr``/``momentum``/
+    ``weight_decay`` -- and the failure surfaced only when the next
+    ``optimizer.step()`` raised ``KeyError: 'momentum'`` from inside torch.  Plain
+    SGD hides it: it keeps no state, and its group carries fewer keys to lose.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    path = Path(tempfile.gettempdir()) / f"aitrainer-pp-resume-{os.environ.get('MASTER_PORT', '0')}"
+    config = FrameworkConfig.from_dict({
+        "parallel": {"pp_size": world, "pp_schedule": "gpipe", "num_microbatches": world}})
+
+    def build():
+        torch.manual_seed(1234)
+        module = torch.nn.Sequential(*[torch.nn.Linear(8, 8) for _ in range(world)])
+        runtime = Runtime(device="cpu", seed=1234)
+        wrapped = parallelize(module, config=config, runtime=runtime)
+        # momentum is what makes the group worth carrying: without state the
+        # optimizer cannot tell a restored group from a fresh one.
+        optimizer = torch.optim.SGD(wrapped.parameters(), lr=0.05, momentum=0.9)
+        return Trainer(wrapped, optimizer, config=config, runtime=runtime,
+                       loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+
+    generator = torch.Generator().manual_seed(9)
+    batches = [(torch.randn(4, 8, generator=generator), torch.randn(4, 8, generator=generator))
+               for _ in range(2)]
+    trainer = build()
+    trainer.train_step(batches[0])
+    trainer.save_sharded(path)
+    dist.barrier()
+
+    resumed = build()
+    resumed.load_sharded(path)
+    wanted = ("lr", "momentum", "dampening", "weight_decay")
+    missing = [key for key in wanted if key not in resumed.optimizer.param_groups[0]]
+    stepped = True
+    try:
+        resumed.train_step(batches[1])
+    except KeyError:
+        stepped = False
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+    return {"rank": rank, "missing": missing, "groups_complete": not missing,
+            "stepped": stepped,
+            "state_entries": sum(len(entry) for entry in resumed.optimizer.state.values())}
+
+
 @case("profiler_captures_collectives")
 def profiler_captures_collectives(rank: int, world: int, dist, options: dict) -> dict:
     """``Profiler.capture`` must find the collectives it cannot be wired into.

@@ -223,13 +223,23 @@ python scripts/verify_parallel.py --report-dir artifacts/verify
 bash scripts/run_all_tests.sh --world-size 2 --report-dir artifacts/server_report
 ```
 
-`verify_parallel.py` trains the same small model three ways and compares them on
-forward output, loss, gradients and the parameter update.  It found two real
-defects that every existing test missed: both pipeline schedules backpropagated
-a stage's received *activation* instead of its produced *output*, which left
-every interior stage's parameters at `grad is None` for the whole run while the
-loss stayed correct and `backward_complete` reported true.  At pp=2 there is no
-interior stage, so no two-stage run could see it.
+`verify_parallel.py` trains the same small model every way this host can run and
+compares each against a single-process baseline on forward output, loss, the
+parameter update and the final weights.  Every combination also saves a sharded
+checkpoint, loads it into a second trainer, and requires the parameters back bit
+for bit and the RESUMED step to land where the uninterrupted one did -- which is
+what covers the optimizer's momentum, the step counters and every RNG stream.  A
+report ends with a table of every combination against every other, so "these are
+equivalent ways to run one training" is stated without reference to a baseline.
+
+It has found three real defects that every existing test missed.  Both pipeline
+schedules backpropagated a stage's received *activation* instead of its produced
+*output*, leaving every interior stage's parameters at `grad is None` for the
+whole run while the loss stayed correct and `backward_complete` reported true (at
+pp=2 there is no interior stage, so no two-stage run could see it).  And
+`load_sharded` on a pipeline returned successfully while dropping four scalar
+keys from the optimizer's parameter groups, so the failure surfaced only on the
+NEXT step, as `KeyError: 'momentum'` from inside `torch.optim`.
 
 Use `--world-size 4` (or `8`) to execute the PP combination entry as a real job;
 a two-rank run records it as structurally validated but blocked by its required

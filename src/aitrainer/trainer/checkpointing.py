@@ -113,6 +113,35 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
                      None if math.isnan(gauss) else gauss))
 
 
+def _restore_missing_group_keys(optimizer: Any, saved: list[dict[str, Any]]) -> list[str]:
+    """Put back any optimizer hyperparameter the load dropped.
+
+    ``set_optimizer_state_dict`` adopts the checkpoint's ``param_groups``, and DCP
+    does not always fill every non-tensor leaf of them.  Measured on a two-stage
+    pipeline with SGD+momentum: ``load_sharded`` returned successfully and rank
+    0's group came back without ``dampening``/``lr``/``momentum``/``weight_decay``
+    while rank 1's came back whole -- the loss was never taken, and the failure
+    surfaced on the NEXT step as ``KeyError: 'momentum'`` (``'betas'`` with AdamW)
+    from inside ``torch.optim``, which names the key but not where it went.
+
+    ``setdefault`` only fills what is absent, so a checkpoint that does carry a
+    value keeps it.  The group count is checked because a mismatch would silently
+    misalign which group is which.
+    """
+    restored: list[str] = []
+    groups = optimizer.param_groups
+    if len(groups) != len(saved):
+        raise CheckpointError(
+            f"optimizer has {len(groups)} parameter groups but the checkpoint was taken "
+            f"with {len(saved)}; refusing to guess which is which")
+    for current, previous in zip(groups, saved):
+        for key, value in previous.items():
+            if key not in current:
+                current[key] = value
+                restored.append(key)
+    return restored
+
+
 def _object_state(obj: Any) -> dict[str, Any] | None:
     """``obj.state_dict()``, or None when the trainer has no such object.
 
@@ -252,7 +281,9 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
     metadata = manager.load_dcp(path, state=state)
     _restore_rng(state[rng_key])
     set_model_state_dict(module, state["model"])
+    group_defaults = [dict(group) for group in trainer.optimizer.param_groups]
     set_optimizer_state_dict(module, trainer.optimizer, state["optimizer"])
+    _restore_missing_group_keys(trainer.optimizer, group_defaults)
     if trainer.scheduler is not None and state.get("scheduler") is not None:
         trainer.scheduler.load_state_dict(dict(state["scheduler"]))
     if trainer.scaler is not None and state.get("scaler") is not None:

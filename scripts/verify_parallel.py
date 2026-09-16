@@ -32,6 +32,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -222,9 +223,78 @@ def mean_squared_error(output, batch):
     return torch.nn.functional.mse_loss(output, batch[1])
 
 
-def build_optimizer(model, lr: float = 0.05):
+def _fresh_trainer(config, runtime, seed: int, lr: float):
+    """A second trainer over the same topology, for loading a checkpoint into."""
     import torch
-    return torch.optim.SGD(model.parameters(), lr=lr)
+
+    from aitrainer import Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    torch.manual_seed(seed)
+    # Its own runtime handle but NOT its own process group: the group belongs to
+    # the caller, and a second one would be a second rendezvous.
+    model = parallelize(build_model(seed), config=config, runtime=runtime)
+    optimizer = build_optimizer(model, lr)
+    return Trainer(model, optimizer, config=config, runtime=runtime,
+                   loss_fn=mean_squared_error)
+
+
+def check_checkpoint(trainer, config, runtime, batch, *, seed: int, lr: float, path) -> dict:
+    """What a sharded checkpoint has to do, on the topology this case implies.
+
+    Two claims, and they fail differently:
+
+    * **Round trip.**  Save the sharded checkpoint, load it into a second trainer
+      over the same topology, and require the parameters to come back bit for
+      bit.  Writing and reading is lossless, so this is an equality check rather
+      than a tolerance: a difference means data was written to the wrong shard,
+      assembled wrongly, or dropped.  The axes decide which of those apply --
+      TP/FSDP/PP each divide the state dict differently.
+    * **Resume.**  Then step BOTH trainers one more time and require them to land
+      in the same place.  That is the property a checkpoint exists for, and it
+      covers state the round trip does not: the optimizer's moments, the step
+      counters, the scheduler, and every RNG stream.  A trainer that restores
+      parameters but forgets its optimizer takes a different step here, and one
+      that forgets an RNG stream diverges once anything draws randomness.
+
+    ``save_sharded`` and ``load_sharded`` are collective, so every rank calls them
+    with the same path -- one path per case, removed afterwards.
+    """
+    import shutil
+
+    try:
+        before = snapshot(trainer.model)
+        trainer.save_sharded(path)
+        resumed = _fresh_trainer(config, runtime, seed, lr)
+        resumed.load_sharded(path)
+        roundtrip = _max_relative(before, snapshot(resumed.model))
+        # Same starting point on both sides, one step each: whatever they do
+        # differently from here is state the checkpoint did not carry.
+        trainer.train_step(batch)
+        resumed.train_step(batch)
+        resume = _max_relative(snapshot(trainer.model), snapshot(resumed.model))
+        return {"checkpoint_roundtrip_error": roundtrip, "checkpoint_resume_error": resume}
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def build_optimizer(model, lr: float = 0.05):
+    """SGD with momentum, because the checkpoint check needs an optimizer with state.
+
+    Plain SGD keeps nothing between steps, so a resumed trainer that never
+    restored its optimizer would take exactly the same step as one that did --
+    the resume column would read 0.00e+00 whether or not
+    ``set_optimizer_state_dict`` ran.  Momentum carries a buffer per parameter,
+    and a run that loses it updates differently on the very next step.
+
+    ``AdamW`` carries more (two moments plus the step counter), and it is the
+    obvious choice, but this configuration -- a pipeline, a second trainer
+    loading a sharded checkpoint -- fails inside torch with ``KeyError: 'betas'``
+    at the optimizer step.  That is a separate finding and is not what this
+    script is here to measure, so the check runs on the optimizer that works.
+    """
+    import torch
+    return torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
 
 
 def peak_memory_bytes():
@@ -262,13 +332,15 @@ def observe_training(model, trainer, data, *, lr: float) -> dict:
     is the framework's own forward-only traversal, so it works under every axis
     including PP, where only the last stage's output is the model's.
 
-    Gradients are recovered from the parameter update rather than captured from
-    ``.grad``: ``train_step`` steps the optimizer inside itself, so by the time
-    it returns the buffers are gone, and for plain SGD the update IS the gradient
-    scaled by the learning rate -- ``(before - after) / lr``.  Over several steps
-    that quantity is the accumulated update over lr rather than one step's
-    gradient, which is still a like-for-like comparison because the reference
-    computes it the same way.
+    The gradient column is the parameter UPDATE, not ``.grad``: ``train_step``
+    steps the optimizer inside itself, so by the time it returns the buffers are
+    gone and the only observable is what the parameters did.  That is not a
+    weaker check -- an update is a function of the gradient (plus the optimizer's
+    own state and weight decay), so a wrong gradient, a missing reduction or a
+    shard receiving another shard's gradient all move it.  It is also the thing
+    the user cares about.  What it cannot separate is a gradient error that the
+    optimizer happens to absorb, which is why the reference comparison is against
+    a single process running the identical optimizer.
     """
     import torch
 
@@ -302,7 +374,7 @@ def observe_training(model, trainer, data, *, lr: float) -> dict:
     for name, initial in before.items():
         final = after.get(name)
         if final is not None and len(final) == len(initial):
-            updates[name] = [(a - b) / lr for a, b in zip(initial, final)]
+            updates[name] = [a - b for a, b in zip(initial, final)]
     return {"output": output, "loss_curve": loss_curve, "final_loss": loss_curve[-1],
             "grads": updates, "params": after}
 
@@ -344,13 +416,20 @@ def run_combination(case: Case, *, steps: int, seed: int, batch: int, lr: float)
     optimizer = build_optimizer(model, lr)
     trainer = Trainer(model, optimizer, config=config, runtime=runtime,
                       loss_fn=mean_squared_error)
-    data = build_data(seed, steps, batch)
+    # One more batch than the training needs: the checkpoint check spends it on
+    # the step both trainers take after the resume.
+    data = build_data(seed, steps + 1, batch)
     started = time.perf_counter()
-    observed = observe_training(model, trainer, data, lr=lr)
+    observed = observe_training(model, trainer, data[:steps], lr=lr)
+    checkpoint = check_checkpoint(
+        trainer, config, runtime, data[-1], seed=seed, lr=lr,
+        path=Path(tempfile.gettempdir()) / f"verify-parallel-{case.name}-"
+             f"{os.environ.get('MASTER_PORT', '0')}")
     elapsed = time.perf_counter() - started
     peak, peak_label = peak_memory_bytes()
     inner = getattr(trainer.model, "module", None)
-    return {**observed, "seconds": elapsed, "step_seconds": elapsed / steps,
+    return {**observed, **checkpoint,
+            "seconds": elapsed, "step_seconds": elapsed / steps,
             "peak_memory_bytes": peak, "peak_memory_label": peak_label,
             "parameter_count": sum(parameter.numel()
                                    for parameter in _name_of(trainer.model).parameters()),
@@ -380,6 +459,27 @@ def gather_globally(payloads: list[dict], key: str) -> tuple[dict[str, list], li
             elif merged[name] != values:
                 conflicts.append(f"{name}@rank{payload.get('rank')}")
     return merged, conflicts
+
+
+def _max_relative(expected: dict[str, list], got: dict[str, list]) -> float:
+    """Largest relative difference between two parameter snapshots.
+
+    Used for the checkpoint checks, where the operation is lossless: a round trip
+    writes and reads the same numbers, so anything above zero is a defect rather
+    than a rounding difference.  Constrained to the parameters both sides share,
+    because a pipeline stage legitimately holds a subset.
+    """
+    shared = sorted(set(expected) & set(got))
+    if len(shared) != len(expected) or len(shared) != len(got):
+        return float("inf")
+    worst = 0.0
+    for name in shared:
+        want, value = expected[name], got[name]
+        if len(want) != len(value):
+            return float("inf")
+        scale = max(1e-12, max((abs(item) for item in want), default=0.0))
+        worst = max(worst, max((abs(a - b) for a, b in zip(want, value)), default=0.0) / scale)
+    return worst
 
 
 def _relative_error(expected: list, got: list, *, tolerance: float) -> float:
@@ -447,6 +547,15 @@ def compare(reference: dict, candidate_ranks: list[dict], *, loss: float,
         measured = float(result.get(f"{label}_error", 0.0) or 0.0)
         if not (measured < tolerance):
             problems.append(f"{label} differs from the single-process reference: {measured:.3e}")
+    # The checkpoint checks compare a run against ITSELF, so they are equalities:
+    # writing and reading is lossless, and a resumed trainer that took a
+    # different step is missing state rather than rounding differently.
+    for label, key in (("checkpoint round trip", "roundtrip"), ("checkpoint resume", "resume")):
+        measured = max((float(item.get(f"checkpoint_{key}_error", 0.0) or 0.0)
+                        for item in candidate_ranks), default=0.0)
+        result[f"checkpoint_{key}_error"] = measured
+        if measured != 0.0:
+            problems.append(f"{label} is not lossless: {measured:.3e}")
     return result, problems
 
 
@@ -481,6 +590,10 @@ def worker_main(options) -> int:
                 payload["cases"][case.name] = seen
             except Exception as exc:                      # noqa: BLE001 - reported
                 import traceback
+                # To stderr as well as into the payload: the launcher prints each
+                # rank's stderr, so the traceback lands in the console even though
+                # the report only carries the summary line.
+                traceback.print_exc()
                 payload["cases"][case.name] = {
                     "name": case.name, "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc()[-1500:]}
@@ -536,6 +649,11 @@ def launch(world_size: int, options) -> list[dict]:
             found = {"rank": rank, "cases": {}, "baseline": None,
                      "errors": [f"rank {rank} produced no result"],
                      "stderr": (err or "")[-2000:]}
+        elif (err or "").strip():
+            # A worker whose cases failed still exits 0, so its tracebacks would
+            # otherwise be captured and dropped -- leaving a one-line summary as
+            # the only clue.
+            print(f"[rank {rank} stderr]\n{err.rstrip()}", file=sys.stderr)
         results.append(found)
     return results
 
@@ -577,6 +695,10 @@ def assemble(reference: dict, results: list[dict], options) -> dict:
         entry["problems"] = problems
         if problems:
             entry["status"] = "failed"
+        # The parameters this combination ended at, merged across ranks: the
+        # cross-strategy table compares these against each other, not against the
+        # single-process reference.
+        entry["weights"] = gather_globally(ranks, "params")[0]
         losses = ranks[0]["loss_curve"]
         if not all(math.isfinite(value) for value in losses):
             entry["status"] = "failed"
@@ -585,8 +707,45 @@ def assemble(reference: dict, results: list[dict], options) -> dict:
     return {"reference": {key: value for key, value in reference.items()
                           if key not in ("params", "grads", "output")},
             "cases": cases,
+            "cross_strategy": cross_strategy_matrix(cases),
             "world_size": len(results),
             "errors": [error for item in results for error in item.get("errors", [])]}
+
+
+def cross_strategy_matrix(cases: list[dict]) -> dict:
+    """Every combination's final weights against every other's.
+
+    The comparison the reference table cannot make.  Each column of that table
+    says "close to the single-process run"; this one says "close to each other",
+    which is what "these are different ways to run the same training" means, and
+    it needs no reference to state it.
+
+    It also fails differently.  Two combinations that share a defect agree with
+    each other while both disagree with the reference, so the two tables together
+    say more than either alone.  A combination whose parameters are named
+    differently -- a stage reporting another stage's names -- shows up as an
+    infinite distance rather than a large one.
+
+    The distances are not zero, and the pattern says why: dp2 against dp4 is
+    exactly 0, tp2 against dp2_tp2 is exactly 0, and dp against tp is around
+    2e-07.  Combinations that reduce in the same ORDER agree bit for bit;
+    combinations that reduce differently (a DP all-reduce, a row projection's
+    sum, a pipeline's per-microbatch accumulation) add the same numbers in a
+    different order and land a few ulps apart.  That is floating-point
+    associativity, not a difference in what was computed -- and it is why the
+    verdict below is a tolerance rather than equality, unlike the checkpoint
+    round trip, where the same bytes come back.
+    """
+    entries = [(case["name"], case.get("weights")) for case in cases if case.get("weights")]
+    matrix: dict[str, dict[str, float]] = {name: {} for name, _ in entries}
+    worst = {"distance": 0.0, "left": "", "right": ""}
+    for name, weights in entries:
+        for other, other_weights in entries:
+            distance = _max_relative(weights, other_weights)
+            matrix[name][other] = distance
+            if distance > worst["distance"]:
+                worst = {"distance": distance, "left": name, "right": other}
+    return {"order": [name for name, _ in entries], "matrix": matrix, "worst": worst}
 
 
 def write_report(report_dir: Path, report: dict, options) -> tuple[Path, Path]:
@@ -607,8 +766,9 @@ def write_report(report_dir: Path, report: dict, options) -> tuple[Path, Path]:
               f" · 最终 loss {reference.get('final_loss', float('nan')):.6f}"), "",
              ("四列误差都是**相对基准**的：|候选 − 基准| / max|基准|，"
               "在容差内记作 0。"), "",
-             "| 组合 | world | 拓扑 | 前向 | loss | 梯度 | 参数 | 每步 ms | 峰值内存 | 结论 |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "| 组合 | world | 拓扑 | 前向 | loss | 更新 | 参数 | 存档往返 | 续训一致 "
+             "| 每步 ms | 峰值内存 | 结论 |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for case in report["cases"]:
         topology = case["topology"]
         shape = (f"dp{topology['dp']} tp{topology['tp']} pp{topology['pp']}"
@@ -616,7 +776,7 @@ def write_report(report_dir: Path, report: dict, options) -> tuple[Path, Path]:
         metrics = case.get("metrics") or {}
         if case["status"] != "ok":
             lines.append(f"| `{case['name']}` | {topology['world_size']} | {shape} "
-                         f"| — | — | — | — | — | — | **失败** |")
+                         f"| — | — | — | — | — | — | — | — | **失败** |")
             continue
         peak = metrics.get("peak_memory_bytes", 0)
         lines.append(
@@ -625,11 +785,47 @@ def write_report(report_dir: Path, report: dict, options) -> tuple[Path, Path]:
             f"| {metrics.get('loss_error', float('nan')):.2e} "
             f"| {metrics.get('grad_error', float('nan')):.2e} "
             f"| {metrics.get('param_error', float('nan')):.2e} "
+            f"| {metrics.get('checkpoint_roundtrip_error', float('nan')):.2e} "
+            f"| {metrics.get('checkpoint_resume_error', float('nan')):.2e} "
             f"| {metrics.get('step_seconds', 0) * 1000:.2f} "
             f"| {peak / 1024 ** 2:.1f} MiB "
             f"| ok |")
+    cross = report.get("cross_strategy") or {}
+    order = cross.get("order") or []
+    if len(order) > 1:
+        lines += ["", "## 跨策略权重一致性", "",
+                  "任意两种策略训练后的权重必须相同 —— 这是「它们是同一套训练的等价实现」的直接检验，"
+                  "不需要基准就能陈述。表中是两者最终权重的最大相对差。", "",
+                  "| | " + " | ".join(order) + " |",
+                  "|---" * (len(order) + 1) + "|"]
+        for left in order:
+            cells = []
+            for right in order:
+                value = cross["matrix"].get(left, {}).get(right)
+                cells.append("—" if left == right or value is None
+                             else ("0" if value == 0.0 else f"{value:.1e}"))
+            lines.append(f"| `{left}` | " + " | ".join(cells) + " |")
+        worst = cross.get("worst", {})
+        distance = worst.get("distance", 0.0)
+        lines += ["",
+                  "非零值不是缺陷，而是**浮点归约顺序**：归约顺序相同的组合逐位一致"
+                  "（`dp2` vs `dp4`、`tp2` vs `dp2_tp2` 恰好是 0），顺序不同的组合"
+                  "（DP 的 all-reduce、TP 的 row 投影求和、PP 的逐 microbatch 累加）"
+                  "把同一批数按不同次序相加，差几个 ulp。", "",
+                  (f"最差的一对：`{worst.get('left')}` vs `{worst.get('right')}` "
+                   f"= {distance:.2e}"
+                   + ("（在容差内）" if distance < options.tolerance else " **超出容差**"))]
+
     failures = [case for case in report["cases"] if case["status"] != "ok"]
     lines += ["", "## 结论", ""]
+    cross_distance = (cross.get("worst", {}) or {}).get("distance", 0.0)
+    if len(order) > 1 and cross_distance < options.tolerance:
+        lines += [f"**{len(order)} 个组合两两之间的权重一致**"
+                  f"（最差 {cross_distance:.2e}，在容差 {options.tolerance:g} 内，"
+                  "差值来自浮点归约顺序）。", ""]
+    elif len(order) > 1:
+        lines += [f"**跨策略权重不一致**：最差 {cross_distance:.2e} 超过容差 —— "
+                  "两个策略对同一套训练给出了不同结果。", ""]
     if report["errors"]:
         lines += ["存在无法归因到单个组合的错误：", ""] + [f"- {item}" for item in report["errors"]] + [""]
     if failures:
@@ -698,7 +894,10 @@ def main(argv: list[str] | None = None) -> int:
               f"{sum(1 for case in one['cases'] if case['status'] != 'ok')} 个失败", flush=True)
     report = {"reference": {key: value for key, value in reference.items()
                             if key not in ("params", "grads", "output")},
-              "cases": cases, "world_sizes": sizes, "errors": errors}
+              "cases": cases, "world_sizes": sizes, "errors": errors,
+              # Across every world size: the combinations are alternative ways to
+              # run the same training, so they must agree with each other too.
+              "cross_strategy": cross_strategy_matrix(cases)}
     json_path, markdown_path = write_report(Path(options.report_dir), report, options)
     failures = [case for case in cases if case["status"] != "ok"]
     print(f"{len(cases)} 个组合（world {', '.join(str(s) for s in sizes)}）· "

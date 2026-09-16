@@ -1,3 +1,6 @@
+import json
+import os
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -457,3 +460,91 @@ def test_sharded_rng_carries_the_cuda_generators(monkeypatch):
     _restore_rng(state)
     assert applied == [[row.tolist() for row in wanted]], (
         "the saved CUDA state was never handed back to torch")
+
+
+def test_sharded_load_restores_optimizer_group_keys_it_dropped():
+    """A successful load can still leave the optimizer unusable.
+
+    ``set_optimizer_state_dict`` adopts the checkpoint's ``param_groups``, and
+    DCP does not always fill every non-tensor leaf.  Measured on a two-stage
+    pipeline with SGD+momentum: ``load_sharded`` returned, rank 0's group came
+    back without ``dampening``/``lr``/``momentum``/``weight_decay`` while rank 1's
+    came back whole, and the failure surfaced on the NEXT step as
+    ``KeyError: 'momentum'`` from inside ``torch.optim`` -- naming the key but not
+    where it went.
+
+    The restore only fills what is absent, so a checkpoint that does carry a
+    value keeps it, and a group-count mismatch is refused rather than misaligned.
+    """
+    import torch
+
+    from aitrainer.trainer.checkpointing import (
+        CheckpointError,
+        _restore_missing_group_keys,
+    )
+
+    def optimizer(**extras):
+        model = torch.nn.Linear(4, 2)
+        return torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9, **extras)
+
+    # The dropped case: the group came back missing its scalars.
+    subject = optimizer()
+    saved = [{"lr": 0.05, "momentum": 0.9, "dampening": 0, "weight_decay": 0}]
+    for key in ("lr", "momentum", "dampening", "weight_decay"):
+        subject.param_groups[0].pop(key, None)
+    restored = _restore_missing_group_keys(subject, saved)
+    assert sorted(restored) == ["dampening", "lr", "momentum", "weight_decay"]
+    assert subject.param_groups[0]["momentum"] == 0.9
+    subject.step()                       # would raise KeyError before the fix
+
+    # A value the checkpoint carries is NOT overwritten by the default.
+    subject = optimizer()
+    subject.param_groups[0]["lr"] = 0.001
+    _restore_missing_group_keys(subject, [{"lr": 0.05}])
+    assert subject.param_groups[0]["lr"] == 0.001, "an existing value was overwritten"
+
+    # A group count that disagrees is refused, not silently misaligned.
+    with pytest.raises(CheckpointError, match="parameter groups"):
+        _restore_missing_group_keys(optimizer(), [{"lr": 0.05}, {"lr": 0.05}])
+
+
+def test_pipeline_checkpoint_resume_keeps_the_optimizer_usable():
+    """The same property end to end, on the topology that exposed it.
+
+    A pipeline, a momentum optimizer and a sharded checkpoint: save, load into a
+    second trainer, and step.  The step is the assertion -- the defect this
+    covers left the load succeeding and the step raising.
+    """
+    import socket
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    worker = Path(__file__).resolve().parents[1] / "multirank" / "worker.py"
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")}
+    # A free port, not a fixed one: a hardcoded port collided with another
+    # multi-rank test when the whole suite ran together, and the failure looked
+    # like this test's own.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = str(probe.getsockname()[1])
+    processes = []
+    for rank in range(2):
+        processes.append(subprocess.Popen(
+            [sys.executable, str(worker), "--case", "pipeline_checkpoint_resume",
+             "--shape", "2,1,1"],
+            env={**environment, "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": port,
+                 "WORLD_SIZE": "2", "RANK": str(rank)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+    payloads = []
+    for process in processes:
+        out, err = process.communicate(timeout=180)
+        for line in out.splitlines():
+            if line.startswith("RESULT "):
+                payloads.append(json.loads(line[len("RESULT "):]))
+        assert process.returncode == 0, f"rank failed:\n{err[-1500:]}"
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload["stepped"] is True, "the resumed optimizer could not take a step"
+        assert payload["groups_complete"] is True, (
+            f"rank {payload['rank']} lost optimizer group keys: {payload['missing']}")
