@@ -1,168 +1,191 @@
-"""Megatron-style synchronous Column and Row Parallel Linear layers."""
+"""Tensor parallelism through torch's DTensor parallel styles.
+
+This used to be a hand-written pair of layers (``ColumnParallelLinear`` /
+``RowParallelLinear``) that did their own collectives through custom
+``autograd.Function`` wrappers.  Their parameters were ordinary
+``nn.Parameter`` holding a *shard* -- and nothing anywhere recorded that the
+shard was a slice of a larger logical tensor.  That is the defect this module's
+rewrite exists to remove: ``get_model_state_dict`` returned each rank's local
+tensor, ``torch.distributed.checkpoint`` then treated same-named keys as one
+logical tensor, and the last rank to write won.
+
+With ``parallelize_module`` the parameter *is* a ``DTensor``.  The module tree
+is not restructured -- ``q_proj`` stays the ``nn.Linear`` it always was, with
+its weight replaced by a DTensor -- so state-dict keys are unchanged and the
+global shape is recoverable.  Measured at tp=2: ``q_proj.weight`` is a DTensor
+of global shape (8, 8) sharded to (4, 8) per rank, and
+``get_model_state_dict(..., StateDictOptions(full_state_dict=True))`` returns a
+plain (8, 8) tensor equal to the dense model's.
+
+Two consequences shape the code below:
+
+* **An empty plan is not a no-op.**  ``parallelize_module(module, mesh, {})``
+  succeeds and shards nothing, so ``tp_size>1`` would train N identical full
+  replicas -- no communication, no error, just wrong.  :func:`parallelize_tensor_parallel`
+  refuses that.
+* **The styles come from the caller.**  Which projection is column-wise is a
+  statement about the model, so it lives in ``plugins/transformer.py``; this
+  module only knows how to apply it.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from ..core.torch import module_base
-from ..core.torch import rank as _core_rank
-from ..core.torch import world_size as _core_world_size
-
-ModuleBase, nn = module_base()
-
 
 class TPConfigurationError(ValueError):
-    """Raised when a TP dimension or layout contract is invalid."""
+    """Raised when a TP plan cannot be applied to the module it names."""
 
 
-def _require_divisible(value: int, world: int, name: str) -> int:
-    if value % world:
-        raise TPConfigurationError(f"{name}={value} must be divisible by TP world size {world}")
-    return value // world
+def device_mesh(mesh: Any, process_group: Any = None, device_type: str = "cpu") -> Any:
+    """The 1-D TP DeviceMesh, however the caller described it.
+
+    ``parallelize_module`` takes a DeviceMesh, never a ProcessGroup.
+    ``DeviceMeshManager`` exposes a real DeviceMesh for the ``(pp, dp, tp)``
+    topology only when the global ranks are in logical order; for a permuted
+    mapping it deliberately keeps process groups instead (``mesh.py``), so
+    ``from_group`` covers that case.  Same split as ``parallel.fsdp``.
+    """
+    import torch
+    from torch.distributed.device_mesh import DeviceMesh
+    if isinstance(process_group, DeviceMesh):
+        return process_group
+    if process_group is not None:
+        return DeviceMesh.from_group(process_group, device_type)
+    if isinstance(mesh, DeviceMesh):
+        return mesh
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        raise TPConfigurationError(
+            "tensor parallelism needs an initialized process group; torch cannot "
+            "build a device mesh without one. Initialize a process group first -- "
+            "a single-rank one is enough -- then parallelize the module.")
+    return DeviceMesh(device_type, torch.arange(dist.get_world_size(), dtype=torch.int))
 
 
-class ColumnParallelLinear(ModuleBase):
-    """Linear layer with output dimension partitioned across the TP group."""
+def _sharded_norm_style(sequence_dim: int) -> Any:
+    """A style that shards a **replicated** input, runs the module, and gathers back.
 
-    def __init__(self, input_size: int, output_size: int, *, bias: bool = True,
-                 gather_output: bool = False, skip_bias_add: bool = False,
-                 process_group: Any = None, init_method: Any = None,
-                 overlap_controller: Any = None) -> None:
-        if nn is None:  # type: ignore[truthy-function]
-            raise ImportError("ColumnParallelLinear requires PyTorch")
-        import torch
-        super().__init__()
-        self.input_size, self.output_size = input_size, output_size
-        self.process_group = process_group
-        self.overlap_controller = overlap_controller
-        self.tp_size = _core_world_size(process_group)
-        self.tp_rank = _core_rank(process_group) if self.tp_size > 1 else 0
-        self.output_size_per_partition = _require_divisible(output_size, self.tp_size, "output_size")
-        self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, input_size))
-        self.bias = nn.Parameter(torch.empty(self.output_size_per_partition)) if bias else None
-        self.gather_output = gather_output
-        self.skip_bias_add = skip_bias_add
-        self.reset_parameters(init_method)
+    This is not ``torch.distributed.tensor.parallel.SequenceParallel``, and the
+    difference is the whole reason this function exists.  ``SequenceParallel``
+    *assumes* the input is already a per-rank slice of the sequence and merely
+    annotates it (``DTensor.from_local(..., run_check=False)``).  Feeding it a
+    replicated tensor therefore does not shard anything: the tensor comes back
+    labelled ``Shard(1)`` with a global sequence dimension that is
+    ``world_size`` times too large, and nothing raises.  Measured at world=2
+    with a (2, 4, 8) input: the norm returned a DTensor claiming global shape
+    (2, 8, 8).  The failure surfaced one module later, as
 
-    def reset_parameters(self, init_method: Any = None) -> None:
-        if init_method is not None:
-            init_method(self.weight)
-        else:
-            nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-        if self.bias is not None:
-            bound = self.weight.shape[1] ** -0.5
-            nn.init.uniform_(self.bias, -bound, bound)
+        Sharding propagation failed for Op(op=aten.view.default,
+        args_schema=Spec(S(1) on (2, 8, 8)) ...)
 
-    def forward(self, value: Any, *, input_is_parallel: bool = False) -> Any:
-        import torch
+    -- naming neither sequence parallelism nor the actual cause.
 
-        from .collectives import copy_to_tp, gather_from_tp
-        if not input_is_parallel:
-            if self.overlap_controller is not None:
-                value = self.overlap_controller.submit("tp.forward_input_copy", lambda: copy_to_tp(value, self.process_group))
-            else:
-                value = copy_to_tp(value, self.process_group)
-        output = torch.nn.functional.linear(value, self.weight, None)
-        # Bias must be added while the output is still SHARDED: self.bias holds
-        # output_size_per_partition entries, so adding it after gathering (when the
-        # output is output_size wide) mismatched by a factor of tp_size.  Summing
-        # each shard's bias before concatenation is equivalent to adding the full
-        # bias, and keeps the same numerics.
-        if self.bias is not None and not self.skip_bias_add:
-            output = output + self.bias
-        if self.gather_output:
-            output = gather_from_tp(output, self.process_group, dim=-1)
-            if self.skip_bias_add and self.bias is not None:
-                # The caller fuses the bias add downstream, so it needs a bias that
-                # matches the gathered width, not the shard width.
-                return output, gather_from_tp(self.bias, self.process_group, dim=-1)
-            return output
-        if self.skip_bias_add:
-            return output, self.bias
-        return output
+    torch's arrangement works in its own Llama example because the *embedding*
+    emits a sequence-sharded activation and the entire residual stream stays
+    sharded, so every consumer is written for it.  That is a property of the
+    model, not something this framework can install generically: a plain
+    ``nn.Linear`` in the middle of such a stream cannot even compute, because
+    ``F.linear`` flattens every dimension but the last and DTensor refuses to
+    flatten a sharded one.
 
-    def shard_metadata(self) -> dict[str, Any]:
-        return {"partition_dim": 0, "global_shape": (self.output_size, self.input_size),
-                "local_shape": tuple(self.weight.shape), "tp_rank": self.tp_rank,
-                "tp_size": self.tp_size}
+    What the hand-written ``SequenceParallelLayerNorm`` actually did was much
+    narrower, and generically installable: take the local slice of the sequence
+    (a local ``chunk`` -- no communication, every rank has the full tensor),
+    normalise it, and all-gather the result back.  Only the norm's own
+    activation was ever sharded.  This style reproduces exactly that, with
+    DTensor placements doing the communication:
 
-    @classmethod
-    def from_dense(cls, dense: Any, *, process_group: Any = None, **kwargs: Any) -> ColumnParallelLinear:
-        import torch
-        layer = cls(dense.in_features, dense.out_features, bias=dense.bias is not None,
-                    process_group=process_group, **kwargs)
-        rank = _core_rank(process_group) if _core_world_size(process_group) > 1 else 0
-        start = rank * layer.output_size_per_partition
-        with torch.no_grad():
-            layer.weight.copy_(dense.weight[start:start + layer.output_size_per_partition])
-            if layer.bias is not None and dense.bias is not None:
-                layer.bias.copy_(dense.bias[start:start + layer.output_size_per_partition])
-        return layer
+    * ``from_local`` on the local chunk, so the global shape is right;
+    * the returned DTensor carries ``Shard(sequence_dim)`` through the norm;
+    * ``redistribute(Replicate())`` gathers on the way out, and its backward
+      reduce-scatters -- which is what the old ``gather_from_sequence`` did by
+      hand.
+
+    The replicated parameters' gradients need no ``register_hook``: DTensor
+    propagates a Partial gradient for a Replicate parameter fed by a sharded
+    activation and reduces it in autograd.  That is the property
+    ``test_sequence_parallel_layernorm_gradients_match_dense`` and its
+    ``..._reduction_is_load_bearing`` counterfactual check -- the old code did
+    this reduction by hand, and without it the copies diverged.
+    """
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+    from torch.distributed.tensor.parallel import ParallelStyle
+
+    class _ShardedNorm(ParallelStyle):
+        def _apply(self, module: Any, device_mesh: Any) -> Any:
+            import torch
+
+            def prepare_input(inputs: Any, mesh: Any) -> Any:
+                # Describe the scatter as a layout transition and let DTensor's
+                # autograd invert it.  Hand-rolling the local `chunk` here is
+                # measurably wrong: the chunk's backward hands each rank only
+                # its OWN slice's contribution to the input gradient, so with a
+                # replicated input every rank ends up with a partially-filled
+                # gradient -- measured at world=2 as max|dInput| = 4.8e-03 on
+                # one rank and 7.0e-03 on the other, against 9.3e-10 for the
+                # unsharded path.  Replicate -> Shard is that same local chunk
+                # on the way in, and its autograd is Shard -> Replicate, an
+                # all-gather -- which is exactly what the old
+                # `scatter_sequence`/`gather_sequence` pair did by hand.
+                value = inputs[0]
+                replicated = (value if isinstance(value, DTensor) else DTensor.from_local(
+                    value, mesh, [Replicate()], run_check=False))
+                return (replicated.redistribute(placements=(Shard(sequence_dim),)), *inputs[1:])
+
+            def prepare_output(output: Any, mesh: Any) -> Any:
+                if not isinstance(output, DTensor):
+                    return output
+                return output.redistribute(placements=(Replicate(),)).to_local()
+
+            for name, parameter in module.named_parameters():
+                module.register_parameter(
+                    name, torch.nn.Parameter(DTensor.from_local(
+                        parameter.detach(), device_mesh, [Replicate()], run_check=False)))
+            module.register_forward_pre_hook(
+                lambda mod, inputs: prepare_input(inputs, device_mesh), with_kwargs=False)
+            module.register_forward_hook(lambda mod, inputs, output: prepare_output(output, device_mesh))
+            return module
+
+    return _ShardedNorm()
 
 
-class RowParallelLinear(ModuleBase):
-    """Linear layer with input dimension partitioned across the TP group."""
+def sequence_parallel_styles(module: Any, *, sequence_dim: int = 1) -> dict[str, Any]:
+    """``{fqn: style}`` for every norm the module contains, sharding the sequence.
 
-    def __init__(self, input_size: int, output_size: int, *, bias: bool = True,
-                 input_is_parallel: bool = False, skip_bias_add: bool = False,
-                 process_group: Any = None, init_method: Any = None,
-                 reduce_dtype: Any | None = None, overlap_controller: Any = None) -> None:
-        if nn is None:  # type: ignore[truthy-function]
-            raise ImportError("RowParallelLinear requires PyTorch")
-        import torch
-        super().__init__()
-        self.input_size, self.output_size = input_size, output_size
-        self.process_group = process_group
-        self.overlap_controller = overlap_controller
-        self.tp_size = _core_world_size(process_group)
-        self.tp_rank = _core_rank(process_group) if self.tp_size > 1 else 0
-        self.input_size_per_partition = _require_divisible(input_size, self.tp_size, "input_size")
-        self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition))
-        self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
-        self.input_is_parallel = input_is_parallel
-        self.skip_bias_add = skip_bias_add
-        self.reduce_dtype = reduce_dtype
-        self.reset_parameters(init_method)
+    See :func:`_sharded_norm_style` for why this is a custom style and not
+    torch's ``SequenceParallel``.
+    """
+    import torch
+    style = _sharded_norm_style(sequence_dim)
+    supported = (torch.nn.LayerNorm, torch.nn.Dropout)
+    return {name: style for name, child in module.named_modules()
+            if name and isinstance(child, supported)}
 
-    def reset_parameters(self, init_method: Any = None) -> None:
-        if init_method is not None:
-            init_method(self.weight)
-        else:
-            nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-        if self.bias is not None:
-            bound = self.input_size_per_partition ** -0.5
-            nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, value: Any, *, input_is_parallel: bool | None = None) -> Any:
-        import torch
+def parallelize_tensor_parallel(module: Any, *, styles: dict[str, Any], mesh: Any = None,
+                                process_group: Any = None, device_type: str = "cpu",
+                                src_data_rank: int | None = 0) -> Any:
+    """Apply ``styles`` (``{module fqn: torch ParallelStyle}``) over the TP axis.
 
-        from .collectives import reduce_from_tp, scatter_to_tp
-        is_parallel = self.input_is_parallel if input_is_parallel is None else input_is_parallel
-        if not is_parallel:
-            value = scatter_to_tp(value, self.process_group, dim=-1)
-        output = torch.nn.functional.linear(value, self.weight, None)
-        if self.overlap_controller is not None:
-            output = self.overlap_controller.submit("tp.backward_dgrad_reduce", lambda: reduce_from_tp(output, self.process_group, reduce_dtype=self.reduce_dtype))
-        else:
-            output = reduce_from_tp(output, self.process_group, reduce_dtype=self.reduce_dtype)
-        if self.skip_bias_add:
-            return output, self.bias
-        return output if self.bias is None else output + self.bias
-
-    def shard_metadata(self) -> dict[str, Any]:
-        return {"partition_dim": 1, "global_shape": (self.output_size, self.input_size),
-                "local_shape": tuple(self.weight.shape), "tp_rank": self.tp_rank,
-                "tp_size": self.tp_size}
-
-    @classmethod
-    def from_dense(cls, dense: Any, *, process_group: Any = None, **kwargs: Any) -> RowParallelLinear:
-        import torch
-        layer = cls(dense.in_features, dense.out_features, bias=dense.bias is not None,
-                    process_group=process_group, **kwargs)
-        rank = _core_rank(process_group) if _core_world_size(process_group) > 1 else 0
-        start = rank * layer.input_size_per_partition
-        with torch.no_grad():
-            layer.weight.copy_(dense.weight[:, start:start + layer.input_size_per_partition])
-            if layer.bias is not None and dense.bias is not None:
-                layer.bias.copy_(dense.bias)
-        return layer
+    Returns ``module``, mutated in place: ``parallelize_module`` replaces each
+    named submodule's parameters with DTensors and installs the layout-shifting
+    input/output hooks on that submodule.  Nothing about the tree changes, so
+    ``state_dict`` keys survive.
+    """
+    from torch.distributed.tensor.parallel import parallelize_module
+    tp_mesh = device_mesh(mesh, process_group, device_type)
+    tp_size = int(tp_mesh.size())
+    if tp_size > 1 and not styles:
+        # The measured trap: tp_size=2 over a plain nn.Sequential left the
+        # parameter count unchanged and said nothing.  Every rank would train a
+        # full replica, each on its own slice of the data.
+        raise TPConfigurationError(
+            f"tp_size={tp_size} but the plan names no module to shard, so the model "
+            "would run as independent full replicas with no collectives and no error. "
+            "Name the projections explicitly (see plugins.transformer.TransformerTPPlan), "
+            "or set tp_size=1.")
+    if not styles:
+        return module
+    parallelize_module(module, tp_mesh, styles, src_data_rank=src_data_rank)
+    return module

@@ -62,7 +62,7 @@ def _specs(world_size: int) -> list[MatrixSpec]:
     pp_dp = world_size // 4 if world_size >= 4 and world_size % 4 == 0 else 1
     pp_world = pp_dp * 2 * 2
     return [
-        MatrixSpec("fsdp", "FSDP FULL_SHARD", world_size, 1, 1, "none", "none", 1, world_size),
+        MatrixSpec("fsdp", "FSDP2 fully_shard", world_size, 1, 1, "none", "none", 1, world_size),
         MatrixSpec("fsdp_sp", "FSDP + sequence parallel", sp_dp, sp_size, 1, "megatron", "none", 1, sp_dp * sp_size),
         MatrixSpec("fsdp_sp_tp", "FSDP + sequence parallel + tensor parallel", sp_dp, sp_size, 1,
                    "ulysses", "none", 1, sp_dp * sp_size),
@@ -203,8 +203,12 @@ def _run_fsdp(torch: Any, dist: Any, device: Any, *, steps: int, batch_size: int
     candidate_loss.backward()
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    with wrapped.full_state_dict_context():
-        candidate_state = wrapped.state_dict()
+    # FSDP2 has no full_state_dict_context: parameters are DTensors, and
+    # get_model_state_dict reassembles them into global-shape tensors.  It is
+    # collective, which the old context manager was too (rank0_only=False).
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+    candidate_state = get_model_state_dict(wrapped,
+                                           options=StateDictOptions(full_state_dict=True))
     state_error = 0.0
     if rank == 0:
         expected_state = reference.state_dict()
@@ -255,17 +259,23 @@ def _run_composed(torch: Any, dist: Any, device: Any, spec: MatrixSpec, *, steps
                   batch_size: int) -> dict[str, Any]:
     """Exercise PP -> TP/SP -> FSDP construction and one training step."""
     from aitrainer import (DeviceMeshManager, FSDPConfig, FrameworkConfig, ParallelConfig,
-                           Runtime, SequenceParallelLayerNorm, parallelize)
+                           Runtime, parallelize)
     if dist.get_world_size() != spec.validation_world_size:
         return {"status": "blocked", "reason":
                 f"matrix entry requires world_size={spec.validation_world_size}, "
                 f"launcher has {dist.get_world_size()}"}
 
     class ProjectionBlock(torch.nn.Module):
-        def __init__(self, group: Any, use_sp: bool) -> None:
+        """Named projections, because that is what a TP plan can address.
+
+        The norm is a plain ``nn.LayerNorm`` either way: sequence parallelism is
+        applied by ``parallelize`` through the plan (``parallel.tp``), not by
+        swapping the module out here.
+        """
+
+        def __init__(self) -> None:
             super().__init__()
-            self.norm = (SequenceParallelLayerNorm(16, process_group=group, gather_output=True)
-                         if use_sp else torch.nn.LayerNorm(16))
+            self.norm = torch.nn.LayerNorm(16)
             self.q_proj = torch.nn.Linear(16, 16)
             self.o_proj = torch.nn.Linear(16, 16)
 
@@ -277,8 +287,7 @@ def _run_composed(torch: Any, dist: Any, device: Any, spec: MatrixSpec, *, steps
     mesh = DeviceMeshManager(pp_size=spec.pp_size, dp_size=spec.dp_size, tp_size=spec.tp_size,
                              world_size=world_size, device_type=device.type)
     torch.manual_seed(2201)
-    model = torch.nn.Sequential(*(ProjectionBlock(mesh.tensor_parallel_group, spec.sp_backend != "none")
-                                  for _ in range(max(2, spec.pp_size))))
+    model = torch.nn.Sequential(*(ProjectionBlock() for _ in range(max(2, spec.pp_size))))
     config = FrameworkConfig(
         parallel=ParallelConfig(dp_size=spec.dp_size, tp_size=spec.tp_size, pp_size=spec.pp_size,
                                 sp_backend=spec.sp_backend, pp_schedule=spec.pp_schedule,
@@ -303,7 +312,11 @@ def _run_composed(torch: Any, dist: Any, device: Any, spec: MatrixSpec, *, steps
             optimizer.zero_grad(set_to_none=True)
             result = parallel_model.pipeline_step((inputs, targets), loss_fn=loss_fn)
             optimizer.step()
-        loss_value = result.get("loss") if result is not None else None
+        # ``ScheduleOutput`` is a dataclass, not a dict.  This called
+        # ``result.get("loss")`` -- which does not exist, so the PP entries of
+        # this matrix had never completed a single step at world=4.  Found by
+        # running them for the first time rather than by reading.
+        loss_value = result.loss if result is not None else None
         local_loss = float(loss_value.item()) if torch.is_tensor(loss_value) else 0.0
     else:
         local_loss = 0.0

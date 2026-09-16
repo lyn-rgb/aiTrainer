@@ -85,18 +85,31 @@ def test_trainer_construction_validates_the_config_once():
     assert len(calls) == 1, f"config validated {len(calls)} times during construction"
 
 
-def test_fsdp_refuses_forward_prefetch_without_a_trace():
-    """The second layer must agree with the first, not silently disagree.
+def test_fsdp_requires_a_process_group():
+    """FSDP2 cannot invent a device mesh, and torch's own failure misleads.
 
-    ``config.validate`` rejects ``forward_prefetch`` without a finalised
-    execution trace.  ``FSDPWrapper`` ANDed the flag away instead, so a caller
-    that bypassed config validation was told nothing -- "prefetch was refused"
-    and "prefetch is off" are different things to report.
+    ``fully_shard`` with no mesh performs an env:// rendezvous, so a
+    single-process caller that forgot to initialize a group got
+    ``environment variable RANK expected, but not set`` -- an error that names
+    neither FSDP nor the missing process group.  ``wrap_fsdp`` builds the mesh
+    itself and therefore gets to say what is actually wrong.
+
+    This replaced a test for ``forward_prefetch``/``execution_trace_complete``:
+    both fields are gone with FSDP1, since neither had an FSDP2 counterpart.
     """
     torch = pytest.importorskip("torch")
-    from aitrainer import FSDPConfig
-    from aitrainer.parallel.fsdp import FSDPConfigurationError, FSDPWrapper
+    import torch.distributed as dist
 
-    with pytest.raises(FSDPConfigurationError):
-        FSDPWrapper(torch.nn.Linear(3, 2),
-                    config=FSDPConfig(forward_prefetch=True, execution_trace_complete=False))
+    from aitrainer.parallel.fsdp import FSDPConfigurationError, wrap_fsdp
+
+    if dist.is_initialized():
+        pytest.skip("the process group is already initialized, so the guard cannot fire")
+
+    class _Runtime:
+        world_size = 1
+
+        class state:
+            device = "cpu"
+
+    with pytest.raises(FSDPConfigurationError, match="process group"):
+        wrap_fsdp(torch.nn.Linear(3, 2), runtime=_Runtime(), mesh=None, config=None)

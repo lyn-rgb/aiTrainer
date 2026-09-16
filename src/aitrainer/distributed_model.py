@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import Any, Iterable
 
 from .core.batching import call_with_inputs, compute_loss
+from .parallel.fsdp import no_gradient_sync
 from .parallel.pp_schedule import ScheduleOutput
 
 
@@ -35,7 +35,17 @@ class DistributedModel:
         return self.module.load_state_dict(state, **kwargs)
 
     def no_sync(self):
-        return getattr(self.module, "no_sync", nullcontext)()
+        """Defer the gradient reduction; see :func:`parallel.fsdp.no_gradient_sync`.
+
+        This used to be ``getattr(self.module, "no_sync", nullcontext)()``, which
+        silently degraded to a no-op for anything without that exact method --
+        including every FSDP2 module, since FSDP2 renamed it.  The result would
+        have been a full gradient reduction per microbatch instead of one per
+        accumulation window: slower, and no exception to notice it by.
+        """
+        if hasattr(self.module, "no_sync"):
+            return self.module.no_sync()
+        return no_gradient_sync(self.module)
 
 
 class PipelineStage:
@@ -69,13 +79,15 @@ class PipelineStage:
         return self.train(False)
 
     def no_sync(self):
-        return self.module.no_sync() if hasattr(self.module, "no_sync") else nullcontext()
+        if hasattr(self.module, "no_sync"):
+            return self.module.no_sync()
+        return no_gradient_sync(self.module)
 
-    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0) -> Any:
-        if hasattr(self.module, "clip_grad_norm_"):
-            return self.module.clip_grad_norm_(max_norm, norm_type)
-        import torch
-        return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm, norm_type=norm_type)
+    # No clip_grad_norm_ method here.  It existed, had no callers, and its
+    # fallback was torch.nn.utils -- which under FSDP2 silently returns a
+    # shard-local norm (see parallel.fsdp.clip_grad_norm_).  The trainer clips
+    # through that function with this stage as the module, so a second route to
+    # the same operation could only drift.
 
     def to(self, *args: Any, **kwargs: Any) -> "PipelineStage":
         self.module.to(*args, **kwargs)

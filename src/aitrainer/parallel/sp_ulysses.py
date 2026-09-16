@@ -1,11 +1,59 @@
-"""Ulysses-style attention exchange with explicit head/sequence layouts."""
+"""Ulysses-style attention exchange with explicit head/sequence layouts.
+
+Ulysses has no DTensor equivalent -- torch's TP styles cover column/row
+projections and sequence-sharded norms, not an all-to-all head exchange -- so
+it stays hand-written.  It also depends on ``all_to_all``, which Gloo does not
+implement, so every ``world_size > 1`` path here is CUDA/NCCL only;
+``tests/unit/test_multirank_gloo.py`` pins that refusal rather than hiding it.
+
+``all_to_all_layout`` used to live in ``parallel/collectives.py`` alongside the
+hand-rolled TP collectives.  Those are gone (DTensor redistributes now), and a
+module called "collectives" holding one Ulysses helper would misdescribe itself,
+so it moved here.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..core.torch import world_size as _core_world_size
-from .collectives import all_to_all_layout
+
+
+def _normalize_dim(dim: int, ndim: int) -> int:
+    if not -ndim <= dim < ndim:
+        raise ValueError(f"dim={dim} is invalid for tensor rank {ndim}")
+    return dim % ndim
+
+
+def all_to_all_layout(value: Any, *, scatter_dim: int, gather_dim: int, group: Any = None) -> Any:
+    """Synchronous all-to-all for equal contiguous chunks on two dimensions."""
+    import torch
+    class Function(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, x: Any) -> Any:
+            ctx.scatter_dim, ctx.gather_dim, ctx.group = scatter_dim, gather_dim, group
+            return _all_to_all_impl(x, scatter_dim, gather_dim, group)
+
+        @staticmethod
+        def backward(ctx: Any, grad: Any) -> tuple[Any]:
+            value = _all_to_all_impl(grad, ctx.gather_dim, ctx.scatter_dim, ctx.group)
+            return (value,)
+    return Function.apply(value)
+
+
+def _all_to_all_impl(value: Any, scatter_dim: int, gather_dim: int, group: Any) -> Any:
+    world = _core_world_size(group)
+    if world == 1:
+        return value
+    import torch
+    sd, gd = _normalize_dim(scatter_dim, value.ndim), _normalize_dim(gather_dim, value.ndim)
+    if value.shape[sd] % world:
+        raise ValueError(f"scatter dimension {value.shape[sd]} is not divisible by world size {world}")
+    chunks = value.chunk(world, dim=sd)
+    import torch.distributed as dist
+    outputs = [torch.empty_like(chunks[0]) for _ in range(world)]
+    dist.all_to_all(outputs, list(chunks), group=group)
+    return torch.cat(outputs, dim=gd).contiguous()
 
 
 class SPConfigurationError(ValueError):

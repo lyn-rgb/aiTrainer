@@ -7,34 +7,11 @@ from typing import Any
 from .capability import validate_capabilities
 from .config import FrameworkConfig
 from .parallel.fsdp import wrap_fsdp
+from .parallel.tp import parallelize_tensor_parallel, sequence_parallel_styles
 from .mesh import DeviceMeshManager
-from .plugins.transformer import TransformerTPPlan, replace_linear_modules
+from .plugins.transformer import TransformerTPPlan
 from .parallel.pp_shapes import split_sequential
 from .distributed_model import PipelineStage
-
-
-def _apply_sequence_parallel(module: Any, *, process_group: Any) -> Any:
-    """Replace ordinary LayerNorm leaves with explicit TP-group SP layers."""
-    import torch
-    from .parallel.sp_sequence import SequenceParallelLayerNorm
-
-    for name, child in list(module.named_children()):
-        if isinstance(child, SequenceParallelLayerNorm):
-            continue
-        if isinstance(child, torch.nn.LayerNorm):
-            replacement = SequenceParallelLayerNorm(
-                child.normalized_shape, eps=child.eps,
-                elementwise_affine=child.elementwise_affine,
-                process_group=process_group, input_is_parallel=False, gather_output=True,
-            )
-            if child.elementwise_affine:
-                with torch.no_grad():
-                    replacement.norm.weight.copy_(child.weight)
-                    replacement.norm.bias.copy_(child.bias)
-            setattr(module, name, replacement)
-        else:
-            _apply_sequence_parallel(child, process_group=process_group)
-    return module
 
 
 def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
@@ -55,10 +32,11 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
                 raise RuntimeError("parallelize requires an initialized process group for world_size>1")
         except ImportError as exc:
             raise RuntimeError("PyTorch distributed is required for multi-rank parallelize") from exc
+    device_type = str(getattr(getattr(runtime, "state", None), "device", "cpu")).split(":", 1)[0]
     mesh = mesh or DeviceMeshManager(
         pp_size=config.parallel.pp_size, dp_size=config.parallel.dp_size,
         tp_size=config.parallel.tp_size, world_size=runtime.world_size,
-        device_type=str(getattr(getattr(runtime, "state", None), "device", "cpu")).split(":", 1)[0],
+        device_type=device_type,
     )
     coordinate = mesh.coordinate
     if config.parallel.pp_size > 1:
@@ -69,12 +47,21 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
     else:
         stage_id = 0
         stage = model
-    tp_group = process_group if process_group is not None else mesh.tensor_parallel_group
-    if config.parallel.sp_backend != "none":
-        stage = _apply_sequence_parallel(stage, process_group=tp_group)
-    if config.parallel.tp_size > 1:
-        stage = replace_linear_modules(stage, process_group=tp_group, plan=tp_plan,
-                                       reduce_dtype=config.precision.reduce_dtype)
+    # TP and SP go through one ``parallelize_module`` call so that a single
+    # device mesh and a single style dict describe the stage.  They stay
+    # independent otherwise: the plan decides the projections, and SP adds the
+    # norms.  See ``plugins.transformer.TransformerTPPlan.styles`` for why SP
+    # does not also move the projection layouts.
+    sequence_parallel = config.parallel.sp_backend != "none"
+    if config.parallel.tp_size > 1 or sequence_parallel:
+        plan = tp_plan or TransformerTPPlan()
+        styles = plan.styles(stage)
+        if sequence_parallel:
+            styles.update(sequence_parallel_styles(stage))
+        plan.validate_dimensions(stage, tp_size=config.parallel.tp_size)
+        stage = parallelize_tensor_parallel(
+            stage, styles=styles, mesh=mesh.submesh("tp"),
+            process_group=process_group, device_type=device_type)
     if config.fsdp.enabled:
         stage = wrap_fsdp(stage, runtime=runtime, mesh=mesh, config=config.fsdp)
     if config.parallel.pp_size > 1:

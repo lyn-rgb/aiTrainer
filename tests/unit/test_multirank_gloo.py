@@ -7,10 +7,13 @@ real multi-rank job* are exercised for real:
 
 * §4.10 a -- canonical ``new_group`` ordering, with the removed ordering kept as
   a negative control that must still deadlock;
-* §4.10 b -- gathered column-parallel bias against a dense reference;
-* §4.10 c -- sequence-parallel LayerNorm parameter-gradient reduction;
-* §4.10 d -- the variable-length Ulysses refusal;
-* §4.1 -- ``no_sync`` accumulation across replicas.
+* §4.1 -- ``no_sync`` accumulation across replicas, and the FSDP2 properties that
+  replaced it (accumulation window, global gradient norm);
+* tensor and sequence parallelism against dense references, including the
+  compounded DP+TP(+SP) axes and the layouts those produce;
+* checkpointing at world_size > 1: the per-rank format, the opt-in DCP format on
+  every axis, and resharding a sharded checkpoint into a single process;
+* §4.10 d -- the variable-length Ulysses refusal.
 
 ``torchrun`` cannot start here (its rendezvous resolves the hostname through
 mDNS and dies with ``gai error: 8``), but that is a property of ``torchrun``,
@@ -82,31 +85,115 @@ def test_group_creation_order_is_load_bearing():
         f"expected a store-barrier timeout from the legacy ordering, got:\n{combined[-2000:]}")
 
 
-def test_column_parallel_gather_output_bias_matches_dense():
-    """§4.10 b: the shard-width bias must be added before gathering."""
-    for payload in require_success(run_case("column_parallel_bias", 2, hard_timeout=60.0)):
+def test_tensor_parallel_matches_dense_and_stays_dtensor():
+    """Two claims: the sharded numbers are right, and the sharding is *represented*.
+
+    The first is ordinary correctness.  The second is why the hand-written
+    layers were replaced: their parameters were plain tensors holding a shard,
+    so ``get_model_state_dict`` reported each rank's slice and
+    ``torch.distributed.checkpoint`` kept whichever rank wrote last. The global
+    shape and the DTensor placement are what make the sharded checkpoint path
+    meaningful, and neither shows up in a numeric comparison.
+    """
+    for payload in require_success(run_case("tensor_parallel_matches_dense", 2, hard_timeout=120.0)):
         assert payload["forward_error"] < TOLERANCE
-        assert payload["fused_error"] < TOLERANCE, "skip_bias_add returned a shard-width bias"
         assert payload["input_grad_error"] < TOLERANCE
+        for name, error in payload["parameter_errors"].items():
+            assert error < TOLERANCE, f"{name} diverged from the dense reference"
+        assert payload["weight_type"] == "DTensor", (
+            "the parameter came back as a plain tensor, so nothing records that it is a "
+            "slice of a larger logical tensor")
+        assert "Shard" in payload["weight_placements"]
+        assert payload["weight_global_shape"] == payload["expected_global_shape"], (
+            "the DTensor must report the GLOBAL shape; a local one is the old defect")
+        assert payload["weight_local_shape"][0] * 2 == payload["weight_global_shape"][0], (
+            "the local shard is not half the global weight at tp=2")
 
 
-def test_sequence_parallel_layernorm_gradients_match_dense():
-    """§4.10 c: replicated norm parameters need the TP-reduced gradient."""
-    for payload in require_success(run_case("sp_layernorm_grad_reduction", 2, hard_timeout=60.0)):
+def test_a_plan_that_names_nothing_is_refused():
+    """``tp_size>1`` over an unmatched model must raise, not replicate silently.
+
+    Measured before the guard: a plain ``nn.Sequential`` at tp_size=2 kept its
+    full parameter count on every rank and printed nothing -- N ranks training N
+    full copies on N slices of the data.  Asserting the *message* matters too,
+    because the plausible failure is an error the reader cannot act on.
+    """
+    for payload in require_success(run_case("tensor_parallel_refuses_an_unmatched_plan", 2,
+                                            hard_timeout=60.0)):
+        assert payload["refused"] is True, (
+            "an unmatched plan was accepted, so the model was silently replicated")
+        assert "names no module to shard" in payload["message"]
+        assert "tp_size=1" in payload["message"], "the error must say how to proceed"
+
+
+@pytest.mark.parametrize(("world", "options"), [
+    (2, {"dp": 2, "tp": 1}),
+    (2, {"dp": 1, "tp": 2}),
+    (2, {"dp": 1, "tp": 2, "sp": "megatron"}),
+    (4, {"dp": 2, "tp": 2}),
+])
+def test_compounded_axes_match_dense(world, options):
+    """``parallelize`` must equal dense for each axis combination it accepts.
+
+    This parameterization is the regression test for a composition that was
+    broken and unobserved: after TP parameters became DTensors, ``fully_shard``
+    rejected the DP mesh ``wrap_fsdp`` built (``DeviceMesh.from_group`` has no
+    parent; FSDP2 wants DP and TP to share one), so ``tp_size=2`` with
+    ``fsdp.enabled`` failed at construction while ``dp_size=2`` alone worked.
+
+    Every rank gets identical data here, which makes the single-process run a
+    valid reference -- a DP reduction over identical replicas is the identity on
+    the gradient.  That also means this case cannot see *divergent* replicas;
+    ``test_trainer_fit_over_fsdp_matches_single_process`` and the clipping cases
+    use rank-distinct data for that.
+    """
+    payloads = require_success(run_case("composition_matches_dense", world, options=options,
+                                        hard_timeout=180.0))
+    assert len(payloads) == world
+    for payload in payloads:
         assert payload["forward_error"] < TOLERANCE
-        assert payload["weight_grad_error"] < TOLERANCE
+        assert payload["input_grad_error"] < TOLERANCE
+        for name, error in payload["parameter_errors"].items():
+            assert error < TOLERANCE, f"{name} diverged from the dense reference"
+        assert payload["weight_type"] == "DTensor", (
+            "the composed axes must still leave the parameters representable")
+    if options.get("tp", 1) > 1 and options.get("dp", 1) > 1:
+        placements = payloads[0]["weight_placements"]
+        assert "Shard" in placements and "," in placements, (
+            f"dp=2/tp=2 must shard on BOTH axes; got {placements}")
+
+
+def test_sequence_parallel_matches_dense():
+    """SP inside the norms: the numbers, and the sharding the numbers cannot show.
+
+    The input gradient is the sharp edge.  An earlier version of the style took
+    the local ``chunk`` by hand; a chunk's backward hands each rank only its own
+    slice's contribution, so a *replicated* input ends up with a partially
+    filled gradient -- 4.8e-03 and 7.0e-03 against 9.3e-10 here.  Expressing the
+    scatter as a ``Replicate -> Shard`` transition instead lets DTensor's
+    autograd supply the all-gather that the hand-written ``gather_sequence``
+    used to do.
+    """
+    for payload in require_success(run_case("sequence_parallel_matches_dense", 2,
+                                            hard_timeout=120.0)):
+        assert payload["forward_error"] < TOLERANCE
+        assert payload["input_grad_error"] < TOLERANCE, (
+            "the input gradient through the sharded norm is wrong; this is what a "
+            "hand-rolled scatter loses")
+        assert payload["weight_grad_error"] < TOLERANCE, (
+            "the replicated norm parameters did not receive the reduced gradient")
         assert payload["bias_grad_error"] < TOLERANCE
 
-
-def test_sequence_parallel_layernorm_reduction_is_load_bearing():
-    """Without the reduction each rank's shard gives a different gradient."""
-    payloads = require_success(run_case("sp_layernorm_without_reduction_diverges", 2,
-                                        hard_timeout=60.0))
-    left, right = payloads[0]["weight_grad"], payloads[1]["weight_grad"]
-    worst = max(abs(a - b) for a, b in zip(left, right))
-    assert worst > 0.5, (
-        "the unreduced shard gradients agree, so this case does not demonstrate "
-        f"that the TP-group reduction changes anything (max difference {worst})")
+        observed = payload["observed"]
+        assert observed["type"] == "DTensor", (
+            "the activation inside the norm was not a DTensor, so sequence "
+            "parallelism sharded nothing")
+        assert "Shard" in observed["placements"]
+        assert observed["global_shape"][1] == payload["sequence_length"], (
+            "the DTensor must describe the GLOBAL sequence length")
+        assert observed["local_shape"][1] * 2 == payload["sequence_length"], (
+            "each rank holds half the sequence, which is the whole point of SP -- a "
+            "style that shards nothing would still match the dense numbers exactly")
 
 
 def test_variable_length_ulysses_refuses_at_world_two():
@@ -132,15 +219,97 @@ def test_ulysses_head_exchange_requires_nccl_not_gloo():
 
 
 def test_fsdp_initialises_on_a_cpu_only_host():
-    """FSDP must accept a resolved CPU device instead of inferring one.
+    """FSDP2 must shard in place with a resolved CPU device.
 
     FSDP's own device inference resolves the custom 'mps' backend on a CPU-only
     macOS host and raises ``Custom backend 'mps' not implement
     torch.mps.current_device``.  ``wrap_fsdp`` therefore has to forward the
     device the runtime resolved rather than forwarding CUDA only.
+
+    The parameter type is the part that is not a tautology.  ``fully_shard``
+    returns the module it mutated, so ``wrap_fsdp`` returning a module proves
+    nothing on its own -- a ``wrap_fsdp`` that never called ``fully_shard`` would
+    do the same.  DTensor parameters are what sharding actually looks like.
+
+    ``in_place`` and the class name are a pair, not a contradiction: FSDP2 swaps
+    the instance's class to a dynamically built ``FSDP<ClassName>`` to install
+    its hooks, so the same object answers to a different ``type()``.
     """
     for payload in require_success(run_case("fsdp_cpu_wrap", 2, hard_timeout=60.0)):
-        assert payload["wrapped"] == "FSDPWrapper"
+        assert payload["in_place"] is True, "FSDP2 mutates in place; it returns no wrapper"
+        assert payload["wrapped"] == "FSDPLinear", (
+            "fully_shard installs its hooks by replacing the class of the module it "
+            "was given")
+        assert payload["parameter_types"] == ["DTensor"], (
+            "the module came back unsharded: FSDP2 holds parameters as DTensors")
+
+
+def test_fsdp_gradient_clipping_uses_the_global_norm():
+    """Clipping must not depend on which shard a rank happens to hold.
+
+    The near-miss this guards: ``torch.nn.utils.clip_grad_norm_`` is the obvious
+    replacement for FSDP1's ``module.clip_grad_norm_``, it runs without error on
+    DTensor parameters, and it returns a plausible number -- but that number is
+    the local shard's norm, so each rank scales its gradients differently.
+    Measured before the fix: 0.551 and 0.395 against a true norm of 0.678.
+
+    Two independent checks, because either alone could pass by accident:
+
+    * the reported norm must equal the norm computed from ``full_tensor()``
+      (ground truth, sharing no code with the clipping path);
+    * after a real clip the two ranks must hold identical gradients and the
+      global norm must be the cap.  Agreement alone would not catch a *uniformly*
+      wrong scale, and matching the truth alone would not catch divergence.
+    """
+    payloads = require_success(run_case("fsdp_grad_norm_is_global", 2, hard_timeout=120.0))
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload["measured_norm"] == pytest.approx(payload["true_norm"], rel=1e-5), (
+            f"clip_grad_norm_ reported {payload['measured_norm']} but the global norm is "
+            f"{payload['true_norm']} -- that is the shard-local norm")
+        assert payload["post_clip_norm"] == pytest.approx(payload["cap"], rel=1e-4), (
+            "the clip did not land on the cap, so the scaling used the wrong norm")
+    assert payloads[0]["gradients"] == payloads[1]["gradients"], (
+        "the ranks ended up with different gradients: they clipped by different factors")
+
+
+def test_fsdp_accumulation_window_suppresses_the_reduction():
+    """Stage A's dangerous property: a silent no-op is the only failure mode.
+
+    ``DistributedModel.no_sync`` used to fall back to ``nullcontext`` when the
+    module had no ``no_sync``.  FSDP2 renamed that method, so every FSDP2 config
+    would have degraded to one full gradient reduction per microbatch -- slower,
+    different reduction timing, and no exception anywhere.
+
+    Three assertions, each doing separate work:
+
+    * ``reduced_vs_local`` proves the fixture can tell the two apart.  Both ranks
+      receive different data, so a reduced gradient and a rank-local gradient
+      differ; with identical data this whole case would pass vacuously.
+    * ``materialised_inside_window`` is the direct observation: inside the
+      window FSDP2 leaves ``.grad`` as ``None`` (measured -- it accumulates in
+      an internal buffer and materialises nothing).  A no-op ``no_sync`` would
+      materialise a DTensor on the very first microbatch.
+    * ``flush_vs_four_units`` / ``flush_vs_one_unit``: the boundary backward must
+      flush *all four* accumulations.  Reducing only the last microbatch would
+      still agree with "a reduction happened", so agreeing with ``1 * unit`` is
+      the failure this pins down.  (Measured at 0.0 and 2.8e+00 respectively.)
+    """
+    payloads = require_success(run_case("fsdp_accumulation_window_suppresses_reduction", 2,
+                                        hard_timeout=120.0))
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload["reduced_vs_local"] > 1e-3, (
+            "reduced and rank-local gradients agree, so this case cannot detect "
+            "a missing reduction")
+        assert payload["materialised_inside_window"] == [False, False, False], (
+            "the gradient was materialised inside the accumulation window, so the "
+            "reduce-scatter was not suppressed")
+        assert payload["flush_vs_one_unit"] > 1e-3, (
+            "the boundary backward reduced only the last microbatch; the earlier "
+            "accumulated gradients were dropped")
+        assert payload["flush_vs_four_units"] < 1e-5 * max(1.0, payload["magnitude"]), (
+            "the boundary backward did not flush every accumulated microbatch")
 
 
 def test_trainer_fit_over_fsdp_matches_single_process():
@@ -153,9 +322,15 @@ def test_trainer_fit_over_fsdp_matches_single_process():
 
     The batch count is not a multiple of ``grad_accumulation_steps``, so a
     trailing partial window exists and must be dropped rather than flushed --
-    re-adding the flush makes the multi-rank run fail outright.  This case also
-    exercises ``full_state_dict_context``, whose ``offload_to_cpu=True`` used to
-    segfault the process when the parameters were already on CPU.
+    re-adding the flush makes the multi-rank run fail outright.  It also
+    exercises ``get_model_state_dict``, which replaced FSDP1's
+    ``full_state_dict_context`` (whose ``offload_to_cpu=True`` used to segfault
+    the process when the parameters were already on CPU).
+
+    Note what this case *cannot* catch: the two ranks are fed identical data,
+    so a missing accumulation window (one reduction per microbatch instead of
+    one per window) produces the same sum and the same parameters.  That is
+    ``test_fsdp_accumulation_window_suppresses_the_reduction``'s job.
     """
     reference = require_success(run_case("trainer_fit_fsdp_accumulation", 1,
                                          hard_timeout=120.0))[0]
@@ -169,6 +344,36 @@ def test_trainer_fit_over_fsdp_matches_single_process():
     for payload in replicas:
         assert payload["applied"] == reference["applied"]
         assert payload["weight"] == reference["weight"], "FSDP replica diverged from the reference"
+        assert payload["bias"] == reference["bias"]
+
+
+def test_trainer_gradient_clipping_matches_single_process():
+    """``grad_clip_norm`` end to end, through ``Trainer.fit``, over FSDP2.
+
+    ``test_fsdp_gradient_clipping_uses_the_global_norm`` proves the function is
+    right; this proves the production path *calls* it right.  ``run_optimizer_step``
+    has to pass the sharded module and read the norm where DTensor gradients
+    exist -- no multirank case set ``grad_clip_norm`` before this one, so the
+    wiring had never executed under FSDP2 at all.
+
+    The reference is the world_size=1 run of the same case: identical data on
+    both ranks means FSDP2's reduced gradient equals the single-process gradient,
+    so the global norm, the clip coefficient and every weight must match exactly.
+    """
+    reference = require_success(run_case("trainer_fit_fsdp_clipping", 1,
+                                         hard_timeout=120.0))[0]
+    assert reference["optimizer_steps"] == 5
+    assert None not in reference["grad_norms"], "clipping is configured but no norm was reported"
+    assert max(reference["grad_norms"]) > reference["cap"], (
+        "no step's gradient norm exceeded the cap, so this case never actually clipped")
+
+    replicas = require_success(run_case("trainer_fit_fsdp_clipping", 2, hard_timeout=120.0))
+    assert len(replicas) == 2
+    for payload in replicas:
+        assert payload["grad_norms"] == pytest.approx(reference["grad_norms"], rel=1e-5), (
+            "the norm FSDP2 reported differs from the single-process one -- a shard-local "
+            "norm is strictly smaller than the global norm")
+        assert payload["weight"] == reference["weight"], "clipped weights diverged"
         assert payload["bias"] == reference["bias"]
 
 
@@ -352,22 +557,69 @@ def test_sharded_checkpoint_roundtrip_at_two_ranks():
             "the optimizer state did not survive; the checkpoint is not resumable")
 
 
-def test_sharded_checkpoint_refuses_tp_models():
-    """``save_sharded`` must refuse rather than silently collapse TP shards.
+@pytest.mark.parametrize("axis", ["tp", "pp"])
+def test_sharded_checkpoint_round_trips_every_axis(axis):
+    """``save_sharded``/``load_sharded`` must round-trip TP **and** PP exactly.
 
-    This guards a defect that existed for exactly one commit.  ``get_model_state_dict``
-    understands FSDP and DDP; for a plain module it returns ``module.state_dict()``
-    -- the LOCAL tensor.  Under TP those differ per rank, every rank wrote its
-    version under the same key, DCP kept one, and the load handed that one to
-    everybody: measured at world_size=2/tp=2 as two ranks with different shards
-    both coming back with rank 1's, max|dW| = 5.5e-01.
+    Both axes used to be refused, and the reason was real: ``get_model_state_dict``
+    returned each rank's LOCAL tensor, every rank wrote its version under one key,
+    DCP kept one, and the load handed that one to everybody -- measured at tp=2 as
+    two genuinely-different shards both coming back holding rank 1's values,
+    max|dW| = 5.5e-01, with nothing reporting a problem.
 
-    The worker first gathers every rank's shard and asserts they are not all
-    equal, so this cannot pass vacuously on a model that was never sharded.
+    The repairs differ per axis, which is why the case is parameterized:
+
+    * TP was fixed by making parameters ``DTensor`` (Stage B). DCP now knows
+      ``q_proj.weight`` is ONE tensor sharded over several ranks.
+    * PP was *not* fixed by that. ``split_sequential`` wraps each stage's layers
+      in its own ``nn.Sequential``, so stage 0 and stage 1 both name the child
+      ``0`` -- different tensors under one key. Measured at pp=2 after the TP fix:
+      each rank came back holding the same tensor, neither one its own,
+      max|dW| = 6.4e-01. ``checkpointing._stage_prefix`` namespaces keys by stage
+      and alone took it to 0.000e+00.
+
+    ``per_rank_values_differ`` is what keeps this from passing vacuously: if every
+    rank held the same weights, a corrupted load would look identical to a correct
+    one.
     """
-    for payload in require_success(run_case("sharded_checkpoint_refuses_tp", 2,
-                                            hard_timeout=120.0)):
-        assert payload["shards_differ"] is True, "the fixture was not actually sharded"
-        assert payload["refused"] is True
-        assert "does not support tp_size=2" in payload["message"]
-        assert "save_checkpoint" in payload["message"], "the error must say what to use instead"
+    for payload in require_success(run_case("sharded_roundtrip_by_axis", 2,
+                                            options={"axes": axis}, hard_timeout=180.0)):
+        assert payload["axis"] == axis
+        assert payload["per_rank_values_differ"] is True, (
+            "every rank holds identical weights, so this case cannot detect a load "
+            "that hands one rank's tensor to everybody")
+        assert payload["shards"] == ["__0_0.distcp", "__1_0.distcp"], "not sharded"
+        assert payload["max_diff"] == 0.0, (
+            f"the {axis} round trip changed the weights")
+        assert payload["global_step"] == 2 and payload["optimizer_step"] == 2
+        assert payload["optimizer_state_entries"] > 0, (
+            "the optimizer state did not survive; the checkpoint is not resumable")
+    if axis == "pp":
+        payloads = require_success(run_case("sharded_roundtrip_by_axis", 2,
+                                            options={"axes": axis}, hard_timeout=180.0))
+        assert all(p["keys_collide_across_ranks"] for p in payloads), (
+            "the PP stages no longer share key names, so the stage prefix is no "
+            "longer what makes this work -- the case has stopped testing it")
+
+
+def test_sharded_checkpoint_reshards_to_a_single_process():
+    """The sharded checkpoint must be readable at a different world size.
+
+    This is what "真分片" is for, and the framework did not have it: the old
+    documentation recorded "换 world size 只能拒绝，不能转换". Because the saved
+    tensors are globally described, DCP can hand the whole thing to a single
+    process with **no process group at all** (``no_dist=True``) -- a simultaneous
+    change of world size *and* of TP layout.
+
+    ``shapes_match`` is the part a numeric comparison alone would miss: reading a
+    TP checkpoint into a dense model has to come back at the GLOBAL shape (8, 8),
+    not as one rank's (4, 8) slice.
+    """
+    payloads = require_success(run_case("sharded_reshard_to_one_process", 2,
+                                        hard_timeout=180.0))
+    reader = payloads[0]
+    assert reader["loaded"] is True, "rank 0 did not perform the resharding load"
+    assert reader["max_diff"] == 0.0, "the resharded weights differ from the trained ones"
+    assert reader["shape"] == [8, 8], "the tensor did not come back at its global shape"
+    assert reader["shapes_match"] is True, (
+        "at least one tensor's shape differs between the dense and the sharded view")

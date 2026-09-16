@@ -1,4 +1,11 @@
-"""Launch a tiny FSDP FULL_SHARD training job with torchrun.
+"""Launch a tiny FSDP2 training job.
+
+``torchrun`` cannot start on this host -- its rendezvous resolves the hostname
+through mDNS and dies with ``gai error: 8`` -- so launch it with an explicit
+rendezvous instead::
+
+    for r in 0 1; do MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 WORLD_SIZE=2 RANK=$r \
+        python examples/fsdp_train/train.py & done; wait
 
 CPU/Gloo is useful for API smoke tests; real multi-rank validation requires
 the installed PyTorch build and a supported CUDA/NCCL environment.

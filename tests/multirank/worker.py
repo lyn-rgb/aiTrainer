@@ -112,120 +112,266 @@ def _create_groups(mapping):
 
 
 # --------------------------------------------------------------------------- #
-# §4.10 b -- ColumnParallelLinear gather_output + bias
+# §4.10 b/c -- tensor parallelism and sequence parallelism, over DTensor
 # --------------------------------------------------------------------------- #
-@case("column_parallel_bias")
-def column_parallel_bias(rank: int, world: int, dist, options: dict) -> dict:
-    """A gathered column-parallel layer must equal its dense reference.
+def _tp_block(hidden: int):
+    """A block whose projections the default plan names, with a norm in front.
 
-    The bug it guards: ``self.bias`` holds ``output_size_per_partition`` entries,
-    so adding it AFTER ``gather_output`` mismatched the full width by tp_size.
+    ``norm`` receives the replicated residual stream, which is the arrangement
+    a real transformer has -- and the one that made torch's own
+    ``SequenceParallel`` unusable here (it assumes its input is already a
+    per-rank slice and silently mis-annotates otherwise).
     """
     import torch
     from torch import nn
 
-    from aitrainer.parallel.tp import ColumnParallelLinear
+    class Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(hidden)
+            self.q_proj = nn.Linear(hidden, hidden)
+            self.o_proj = nn.Linear(hidden, hidden)
 
-    group = _tp_group(world, rank)
-    torch.manual_seed(20240915)
-    dense = nn.Linear(8, 12, bias=True)
+        def forward(self, value):
+            return self.o_proj(torch.relu(self.q_proj(self.norm(value))))
 
-    gathered = ColumnParallelLinear.from_dense(dense, process_group=group, gather_output=True)
-    x = torch.randn(4, 8)
-    out = gathered(x)
-    _require(tuple(out.shape) == (4, 12), f"gathered output shape {tuple(out.shape)} != (4, 12)")
-    error = _max_abs_diff(out, dense(x))
-
-    fused = ColumnParallelLinear.from_dense(dense, process_group=group, gather_output=True,
-                                            skip_bias_add=True)
-    fused_out, fused_bias = fused(x)
-    _require(tuple(fused_bias.shape) == (12,),
-             f"skip_bias_add bias width {tuple(fused_bias.shape)} != (12,)")
-    fused_error = _max_abs_diff(fused_out + fused_bias, dense(x))
-
-    # Input gradients must match the dense layer's, which is what makes the
-    # gather's backward pass (an all-gather in reverse) correct.
-    x_parallel, x_dense = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
-    gathered(x_parallel).sum().backward()
-    dense(x_dense).sum().backward()
-    grad_error = _max_abs_diff(x_parallel.grad, x_dense.grad)
-    return {"rank": rank, "forward_error": error, "fused_error": fused_error,
-            "input_grad_error": grad_error}
+    return Block()
 
 
-# --------------------------------------------------------------------------- #
-# §4.10 c -- SequenceParallelLayerNorm parameter-gradient reduction
-# --------------------------------------------------------------------------- #
-@case("sp_layernorm_grad_reduction")
-def sp_layernorm_grad_reduction(rank: int, world: int, dist, options: dict) -> dict:
-    """Replicated norm parameters must receive the TP-reduced gradient.
+def _full(value):
+    return value.full_tensor() if hasattr(value, "full_tensor") else value
 
-    Each rank only sees its own token shard, so without a reduction the weight
-    and bias copies diverge after the first optimizer step even though the
-    forward output and the input gradient are already correct.
+
+@case("tensor_parallel_matches_dense")
+def tensor_parallel_matches_dense(rank: int, world: int, dist, options: dict) -> dict:
+    """TP through ``parallelize`` must equal the dense model -- and stay DTensor.
+
+    Both halves matter and they are different claims.  The numbers say the
+    sharding is correct; the *parameter type* says the sharding is represented,
+    which is what ``torch.distributed.checkpoint`` needs in order to see a
+    global tensor instead of "whatever this rank happened to hold".  The old
+    hand-written layers passed the first and failed the second, which is how
+    ``save_sharded`` came to silently keep one rank's shard for everybody.
+
+    The comparison is against a dense model built from the same seed, so this
+    catches a consistently wrong layout as well as a diverging one.
     """
     import torch
-    from torch import nn
 
-    from aitrainer.parallel.sp_sequence import SequenceParallelLayerNorm
+    from aitrainer import FrameworkConfig, Runtime
+    from aitrainer.parallelizer import parallelize
 
-    group = _tp_group(world, rank)
-    hidden, batch, length = 6, 2, 8
-    torch.manual_seed(4242)
+    hidden, batch, length, seed = 8, 2, 4, 11
+    torch.manual_seed(seed)
+    dense = _tp_block(hidden)
+    generator = torch.Generator().manual_seed(4321)
+    value = torch.randn(batch, length, hidden, generator=generator).requires_grad_(True)
+    expected = dense(value)
+    expected.square().mean().backward()
 
-    dense_norm = nn.LayerNorm(hidden)
-    value = torch.randn(batch, length, hidden)
+    torch.manual_seed(seed)
+    block = _tp_block(hidden)
+    config = FrameworkConfig.from_dict({"parallel": {"tp_size": world}})
+    runtime = Runtime(device="cpu", init_process_group=False)
+    model = parallelize(block, config=config, runtime=runtime)
 
-    parallel = SequenceParallelLayerNorm(hidden, process_group=group, input_is_parallel=True)
-    with torch.no_grad():
-        parallel.norm.weight.copy_(dense_norm.weight)
-        parallel.norm.bias.copy_(dense_norm.bias)
+    inputs = value.detach().clone().requires_grad_(True)
+    output = model(inputs)
+    forward_error = _max_abs_diff(output, expected)
+    output.square().mean().backward()
 
-    chunk = length // world
-    local_value = value[:, rank * chunk:(rank + 1) * chunk, :].clone().requires_grad_(True)
-    local_out = parallel(local_value)
-
-    dense_value = value.clone().requires_grad_(True)
-    dense_out = dense_norm(dense_value)
-    reference_shard = dense_out[:, rank * chunk:(rank + 1) * chunk, :]
-    forward_error = _max_abs_diff(local_out, reference_shard)
-
-    local_out.sum().backward()
-    dense_out.sum().backward()
-    weight_error = _max_abs_diff(parallel.norm.weight.grad, dense_norm.weight.grad)
-    bias_error = _max_abs_diff(parallel.norm.bias.grad, dense_norm.bias.grad)
-
-    # The same reduction must hold for the input gradient, which is the other
-    # half of the contract.
-    input_grad_ok = _max_abs_diff(local_value.grad,
-                                  dense_value.grad[:, rank * chunk:(rank + 1) * chunk, :]) < 1e-6
-    _require(input_grad_ok, "local input gradient does not match the dense reference shard")
-    return {"rank": rank, "forward_error": forward_error, "weight_grad_error": weight_error,
-            "bias_grad_error": bias_error}
+    errors = {}
+    for name, mine, reference in (("q_proj", model.q_proj, dense.q_proj),
+                                  ("o_proj", model.o_proj, dense.o_proj)):
+        for field in ("weight", "bias"):
+            got = getattr(mine, field).grad
+            want = getattr(reference, field).grad
+            errors[f"{name}.{field}"] = max(
+                _max_abs_diff(_full(got), want), _max_abs_diff(_full(getattr(mine, field)),
+                                                              getattr(reference, field)))
+    return {"rank": rank, "forward_error": forward_error,
+            "input_grad_error": _max_abs_diff(_full(inputs.grad), value.grad),
+            "parameter_errors": errors,
+            "weight_type": type(model.q_proj.weight).__name__,
+            "weight_placements": str(model.q_proj.weight.placements),
+            "weight_global_shape": list(model.q_proj.weight.shape),
+            "weight_local_shape": list(model.q_proj.weight.to_local().shape),
+            "expected_global_shape": list(dense.q_proj.weight.shape)}
 
 
-@case("sp_layernorm_without_reduction_diverges")
-def sp_layernorm_without_reduction_diverges(rank: int, world: int, dist, options: dict) -> dict:
-    """Negative control for the reduction: an unreduced replica must diverge.
+@case("composition_matches_dense")
+def composition_matches_dense(rank: int, world: int, dist, options: dict) -> dict:
+    """Compounded axes over one stage: ``parallelize`` must still equal dense.
 
-    Runs the identical sharded computation through a plain ``nn.LayerNorm``, so
-    an unreduced rank-local gradient is what it produces.  The harness asserts
-    the two ranks disagree, which is what makes the reduction load-bearing.
+    This is the case that was missing, and its absence had a cost.  Once TP
+    parameters became DTensors, ``fully_shard`` began rejecting the DP mesh
+    ``wrap_fsdp`` had always built -- ``DeviceMesh.from_group`` makes a mesh with
+    no parent, and FSDP2 requires the DP and TP meshes to share one:
+
+        tp_size=2 + fsdp.enabled  ->  AssertionError: FSDP requires the DP and
+        model parallel TP/EP mesh to have the same parent mesh
+
+    while ``dp_size=2`` alone worked.  No test combined the axes, so nothing
+    said so; ``parallel.dp_axis_mesh`` is the fix and this is the regression.
+
+    ``options["shape"]`` names the axes, so the same case covers
+    ``dp=2``, ``tp=2``, ``tp=2 + sp`` and (at world 4) ``dp=2, tp=2``.  Every
+    rank receives **identical** data, which makes the single-process run a valid
+    reference: a DP reduction over identical replicas is the identity on the
+    gradient, so anything the sharding gets wrong shows up as a difference.
+    Diverging-replica detection is a separate case
+    (``trainer_fit_fsdp_accumulation``), because identical data cannot see it.
     """
     import torch
-    from torch import nn
 
-    hidden, batch, length = 6, 2, 8
-    torch.manual_seed(4242)
-    norm = nn.LayerNorm(hidden)
-    value = torch.randn(batch, length, hidden)
-    chunk = length // world
-    local = value[:, rank * chunk:(rank + 1) * chunk, :].detach().requires_grad_(True)
-    norm(local).sum().backward()
-    return {"rank": rank, "weight_grad": norm.weight.grad.tolist()}
+    from aitrainer import FrameworkConfig, Runtime
+    from aitrainer.parallelizer import parallelize
+
+    dp_size, tp_size, sp_backend = _shape(world, options)
+
+    hidden, batch, length, seed = 8, 2, 4, 77
+    torch.manual_seed(seed)
+    dense = _tp_block(hidden)
+    generator = torch.Generator().manual_seed(2024)
+    value = torch.randn(batch, length, hidden, generator=generator).requires_grad_(True)
+    expected = dense(value)
+    expected.square().mean().backward()
+
+    torch.manual_seed(seed)
+    block = _tp_block(hidden)
+    config = FrameworkConfig.from_dict({
+        "parallel": {"dp_size": dp_size, "tp_size": tp_size, "sp_backend": sp_backend},
+        # FSDP is enabled even at dp_size=1, which is what ``parallel_matrix``
+        # and ``ConfigPreset.fsdp()`` build.  That configuration is not a no-op:
+        # it is the one whose standalone DP mesh tripped FSDP2's parent-mesh
+        # check, so skipping it here would skip the very case that broke.
+        "fsdp": {"enabled": world > 1},
+    })
+    runtime = Runtime(device="cpu", init_process_group=False)
+    model = parallelize(block, config=config, runtime=runtime) if world > 1 else block
+
+    inputs = value.detach().clone().requires_grad_(True)
+    output = model(inputs)
+    output.square().mean().backward()
+    errors = {name: _max_abs_diff(_full(getattr(model, name).weight.grad),
+                                  getattr(dense, name).weight.grad)
+              for name in ("q_proj", "o_proj")}
+    return {"rank": rank, "world": world, "dp_size": dp_size, "tp_size": tp_size,
+            "sp_backend": sp_backend,
+            "forward_error": _max_abs_diff(output, expected),
+            "input_grad_error": _max_abs_diff(_full(inputs.grad), value.grad),
+            "parameter_errors": errors,
+            "weight_type": type(model.q_proj.weight).__name__,
+            "weight_placements": str(model.q_proj.weight.placements)}
 
 
-# --------------------------------------------------------------------------- #
+def _shape(world: int, options: dict) -> tuple[int, int, str]:
+    """``(dp, tp, sp)`` for this case, defaulting to a shape that fits ``world``."""
+    if "dp" in options or "tp" in options:
+        dp_size = int(options.get("dp", 1))
+        tp_size = int(options.get("tp", 1))
+    elif world == 4:
+        dp_size, tp_size = 2, 2
+    else:
+        dp_size, tp_size = 2, 1
+    _require(dp_size * tp_size == world,
+             f"dp={dp_size} x tp={tp_size} does not match world={world}")
+    return dp_size, tp_size, options.get("sp", "none")
+
+
+@case("tensor_parallel_refuses_an_unmatched_plan")
+def tensor_parallel_refuses_an_unmatched_plan(rank: int, world: int, dist, options: dict) -> dict:
+    """A plan that names nothing must raise instead of replicating silently.
+
+    Measured before the guard: ``tp_size=2`` over a plain ``nn.Sequential``
+    left the parameter count unchanged and printed nothing -- every rank ran a
+    full copy of the model on its own slice of the data, with no collectives
+    and no error.  The failure mode is a model that trains and never converges,
+    which is worse than a crash.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime
+    from aitrainer.parallelizer import parallelize
+
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8))
+    config = FrameworkConfig.from_dict({"parallel": {"tp_size": world}})
+    runtime = Runtime(device="cpu", init_process_group=False)
+    try:
+        parallelize(model, config=config, runtime=runtime)
+    except (ValueError, RuntimeError) as exc:
+        # ValueError covers TPConfigurationError; RuntimeError is what torch's
+        # own distributed errors are.  Catching those two rather than Exception
+        # keeps a genuine bug (a NameError, say) from being reported as a
+        # successful refusal.
+        return {"rank": rank, "refused": True, "message": f"{type(exc).__name__}: {exc}"}
+    return {"rank": rank, "refused": False, "message": ""}
+
+
+@case("sequence_parallel_matches_dense")
+def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) -> dict:
+    """SP inside the norms must equal the dense model, and must really shard.
+
+    Two independent claims, and the second is the one that cannot be seen in
+    the numbers:
+
+    * numerics -- forward, the replicated norm parameters' gradients, and the
+      input gradient all match a dense reference.  The input gradient is the
+      sharp edge: an earlier version of the style took the local ``chunk`` by
+      hand, and the chunk's backward gives each rank only its own slice's
+      contribution, so a *replicated* input ends up with a partially-filled
+      gradient -- measured at 4.8e-03 and 7.0e-03 against 9.3e-10.  Writing the
+      scatter as a ``Replicate -> Shard`` layout transition instead lets
+      DTensor's autograd supply the matching all-gather.
+    * that the activation inside the norm is genuinely ``Shard(sequence_dim)``
+      with a global sequence length of ``length`` and a local one of
+      ``length / world``.  A style that sharded nothing would still match the
+      dense reference exactly -- same numbers, no communication -- so the
+      layout observation is the only thing standing between "sequence
+      parallel" and "a no-op that reports success".
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime
+    from aitrainer.parallelizer import parallelize
+
+    hidden, batch, length, seed = 8, 2, 6, 4242
+    torch.manual_seed(seed)
+    dense = _tp_block(hidden)
+    generator = torch.Generator().manual_seed(99)
+    value = torch.randn(batch, length, hidden, generator=generator).requires_grad_(True)
+    dense(value).square().mean().backward()
+
+    torch.manual_seed(seed)
+    block = _tp_block(hidden)
+    config = FrameworkConfig.from_dict({"parallel": {"tp_size": world, "sp_backend": "megatron"}})
+    runtime = Runtime(device="cpu", init_process_group=False)
+    model = parallelize(block, config=config, runtime=runtime)
+
+    observed: dict = {}
+
+    def observe(module, inputs):
+        activation = inputs[0]
+        observed["type"] = type(activation).__name__
+        observed["placements"] = str(getattr(activation, "placements", None))
+        observed["global_shape"] = list(getattr(activation, "shape", []))
+        observed["local_shape"] = (list(activation.to_local().shape)
+                                   if hasattr(activation, "to_local") else None)
+
+    model.norm.register_forward_pre_hook(observe)
+
+    inputs = value.detach().clone().requires_grad_(True)
+    output = model(inputs)
+    forward_error = _max_abs_diff(output, dense(value))
+    output.square().mean().backward()
+    return {"rank": rank, "forward_error": forward_error,
+            "input_grad_error": _max_abs_diff(_full(inputs.grad), value.grad),
+            "weight_grad_error": _max_abs_diff(_full(model.norm.weight.grad),
+                                               dense.norm.weight.grad),
+            "bias_grad_error": _max_abs_diff(_full(model.norm.bias.grad), dense.norm.bias.grad),
+            "observed": observed, "world": world, "sequence_length": length}
+
+
 # §4.10 d -- Ulysses attention
 # --------------------------------------------------------------------------- #
 @case("ulysses_attention_equivalence")
@@ -269,15 +415,19 @@ def ulysses_seq_lens_refuses(rank: int, world: int, dist, options: dict) -> dict
 # --------------------------------------------------------------------------- #
 @case("fsdp_cpu_wrap")
 def fsdp_cpu_wrap(rank: int, world: int, dist, options: dict) -> dict:
-    """``wrap_fsdp`` must be able to initialise FSDP with CPU parameters.
+    """``wrap_fsdp`` must shard in place, on CPU, with a CPU-resolved device.
 
-    The bug it guards: ``wrap_fsdp`` forwarded ``device_id`` to FSDP only when it
-    started with "cuda".  With no device_id, FSDP infers one, and on a CPU-only
-    macOS host that inference resolves the custom 'mps' backend and raises
-    ``AttributeError: Custom backend 'mps' not implement
-    torch.mps.current_device`` -- so the STABLE ``fsdp_full_shard`` capability
-    could not be initialised at all, with an error naming neither FSDP nor the
-    missing argument.
+    Two properties, from two separate defects:
+
+    * FSDP's own device inference resolves the custom 'mps' backend on a
+      CPU-only macOS host and raises ``AttributeError: Custom backend 'mps' not
+      implement torch.mps.current_device``, so ``wrap_fsdp`` has to forward the
+      device the runtime resolved rather than forwarding CUDA only.
+    * FSDP2's ``fully_shard`` is composable and mutates in place, so there is no
+      wrapper object to hand back.  The assertion is on the *type of the
+      parameters* rather than the module, because returning the same module is
+      only meaningful if it actually got sharded -- a ``wrap_fsdp`` that forgot
+      to call ``fully_shard`` would also return the module.
     """
     import torch
 
@@ -289,9 +439,185 @@ def fsdp_cpu_wrap(rank: int, world: int, dist, options: dict) -> dict:
         class state:
             device = "cpu"
 
-    wrapped = wrap_fsdp(torch.nn.Linear(4, 4), runtime=_Runtime(), mesh=None, config=None)
+    module = torch.nn.Linear(4, 4)
+    wrapped = wrap_fsdp(module, runtime=_Runtime(), mesh=None, config=None)
     wrapped(torch.randn(2, 4)).sum().backward()
-    return {"rank": rank, "wrapped": type(wrapped).__name__}
+    return {"rank": rank, "wrapped": type(wrapped).__name__, "in_place": wrapped is module,
+            "parameter_types": sorted({type(p).__name__ for p in wrapped.parameters()})}
+
+
+@case("fsdp_grad_norm_is_global")
+def fsdp_grad_norm_is_global(rank: int, world: int, dist, options: dict) -> dict:
+    """Gradient clipping must use one global norm, not one per shard.
+
+    ``torch.nn.utils.clip_grad_norm_`` reads like the drop-in for FSDP1's
+    ``module.clip_grad_norm_`` and is not one.  DTensor *does* register
+    ``linalg.vector_norm`` -- it returns a ``_NormPartial`` whose
+    ``full_tensor()`` is the sum over the mesh -- but ``nn.utils`` stacks the
+    per-parameter results with ``torch.stack``, which is not DTensor-aware and
+    silently yields the shard-local numbers.  Measured here, at dp=2 on a
+    3-layer model with rank-distinct data, against a true global norm of
+    0.678: rank 0 reported 0.551 and rank 1 reported 0.395.  Nothing raises;
+    the two ranks simply clip by different factors, or skip a clip that was
+    required.
+
+    The worker reports the true norm (computed from ``full_tensor()``, which is
+    the ground truth and shares no code with the clipping path), what
+    ``clip_grad_norm_`` returns, and the post-clip gradients so the test can
+    check that the ranks agree with each other.
+    """
+    import torch
+    from torch import nn
+
+    from aitrainer.mesh import DeviceMeshManager
+    from aitrainer.parallel.fsdp import clip_grad_norm_, wrap_fsdp
+
+    _require(world > 1, "a shard-local norm is only distinguishable from the global one "
+                        "when there is more than one shard")
+
+    class _Runtime:
+        world_size = world
+
+        class state:
+            device = "cpu"
+
+    torch.manual_seed(11)
+    module = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 4))
+    mesh = DeviceMeshManager(dp_size=world, tp_size=1, pp_size=1, world_size=world,
+                             device_type="cpu")
+    sharded = wrap_fsdp(module, runtime=_Runtime(), mesh=mesh, config=None)
+
+    # Rank-distinct data, so each rank's shard has a different norm and a
+    # shard-local total would disagree with the global one *and* with the other
+    # rank's.
+    generator = torch.Generator().manual_seed(700 + rank)
+    inputs = torch.randn(5, 6, generator=generator)
+    targets = torch.randn(5, 4, generator=generator)
+
+    def truth() -> float:
+        return float(sum(parameter.grad.full_tensor().pow(2).sum()
+                         for parameter in sharded.parameters()).sqrt())
+
+    def full_gradients() -> list:
+        return [value for parameter in sharded.parameters()
+                for value in parameter.grad.full_tensor().flatten().tolist()]
+
+    def zero_grads() -> None:
+        for parameter in sharded.parameters():
+            parameter.grad = None
+
+    def backward() -> None:
+        nn.functional.mse_loss(sharded(inputs), targets).backward()
+
+    zero_grads(); backward()
+    honest = truth()
+    # float("inf") as the cap: measure the norm without clipping anything.
+    measured = float(clip_grad_norm_(sharded, float("inf")).item())
+
+    # Now clip for real, and see whether the two ranks land on the same point.
+    zero_grads(); backward()
+    cap = 0.05
+    reported = float(clip_grad_norm_(sharded, cap).item())
+    clipped = truth()
+    gradients = full_gradients()
+    return {"rank": rank, "true_norm": honest, "measured_norm": measured,
+            "reported_norm": reported, "post_clip_norm": clipped, "cap": cap,
+            "gradients": gradients}
+
+
+@case("fsdp_accumulation_window_suppresses_reduction")
+def fsdp_accumulation_window_suppresses_reduction(rank: int, world: int, dist, options: dict) -> dict:
+    """The accumulation window must actually suppress the reduce-scatter.
+
+    This is the one Stage-A property that fails silently.  FSDP1 answered
+    ``no_sync()``; FSDP2 renamed it to ``set_requires_gradient_sync(bool)``, and
+    ``DistributedModel.no_sync`` used to be
+    ``getattr(self.module, "no_sync", nullcontext)()`` -- a missing method
+    degraded to a no-op, so every microbatch would have been reduced separately.
+    Nothing raises; the run is merely slower and the reduction timing differs.
+
+    ``trainer_fit_fsdp_accumulation`` cannot catch that: both ranks there are fed
+    *identical* data, so reducing per microbatch and reducing once at the
+    boundary produce the same sum.  Hence rank-distinct data here, and an
+    explicit assertion that reduced and local gradients differ -- with identical
+    data the whole case would pass vacuously.
+
+    The mechanism is measured, not assumed (Gloo, world=2, torch 2.9):
+
+    * one synced backward populates ``.grad`` -- that value is ``unit``;
+    * after each unsynced backward ``.grad`` is still ``None``.  FSDP2 holds the
+      accumulated gradient in an internal unsharded buffer and materialises
+      nothing, so an optimizer step taken mid-window would be a silent no-op;
+    * the next *synced* backward flushes all four accumulations at once, giving
+      exactly ``4 * unit``, not ``1 * unit``.  That is the property the whole
+      accumulation design rests on, and it is not documented anywhere.
+    """
+    import torch
+    from torch import nn
+
+    from aitrainer.distributed_model import DistributedModel
+    from aitrainer.mesh import DeviceMeshManager
+    from aitrainer.parallel.fsdp import wrap_fsdp
+
+    _require(world > 1, "an accumulation window needs replicas to reduce across")
+
+    class _Runtime:
+        world_size = world
+
+        class state:
+            device = "cpu"
+
+    torch.manual_seed(3)
+    module = nn.Linear(4, 4, bias=True)
+    initial = {name: value.detach().clone() for name, value in module.named_parameters()}
+    mesh = DeviceMeshManager(dp_size=world, tp_size=1, pp_size=1, world_size=world,
+                             device_type="cpu")
+    sharded = wrap_fsdp(module, runtime=_Runtime(), mesh=mesh, config=None)
+    model = DistributedModel(sharded)
+
+    # Rank-distinct data: that is what makes "reduced" and "local" different.
+    generator = torch.Generator().manual_seed(500 + rank)
+    inputs = torch.randn(3, 4, generator=generator)
+    targets = torch.randn(3, 4, generator=generator)
+
+    def local_gradient():
+        """This rank's own gradients, computed with no process group involved."""
+        weight = initial["weight"].clone().requires_grad_()
+        bias = initial["bias"].clone().requires_grad_()
+        nn.functional.mse_loss(inputs @ weight.T + bias, targets).backward()
+        return weight.grad, bias.grad
+
+    def full_grad():
+        """The global weight gradient, or None if FSDP2 has not materialised it."""
+        grad = sharded.weight.grad
+        return None if grad is None else grad.full_tensor()
+
+    def zero_grads() -> None:
+        for parameter in sharded.parameters():
+            parameter.grad = None
+
+    zero_grads()
+    nn.functional.mse_loss(model(inputs), targets).backward()
+    unit = full_grad()
+    _require(unit is not None, "a synced backward must materialise a gradient")
+    reduced_vs_local = float((unit - local_gradient()[0]).abs().max())
+
+    materialised = []
+    zero_grads()
+    for _ in range(3):
+        with model.no_sync():
+            nn.functional.mse_loss(model(inputs), targets).backward()
+        materialised.append(full_grad() is not None)
+
+    nn.functional.mse_loss(model(inputs), targets).backward()  # window boundary
+    total = full_grad()
+    _require(total is not None, "the boundary backward must materialise a gradient")
+    return {"rank": rank,
+            "reduced_vs_local": reduced_vs_local,
+            "materialised_inside_window": materialised,
+            "flush_vs_four_units": float((total - 4 * unit).abs().max()),
+            "flush_vs_one_unit": float((total - unit).abs().max()),
+            "magnitude": float(unit.abs().max())}
 
 
 @case("trainer_fit_fsdp_accumulation")
@@ -336,17 +662,69 @@ def trainer_fit_fsdp_accumulation(rank: int, world: int, dist, options: dict) ->
     applied = [step.optimizer_step for step in trainer.history]
 
     # FSDP shards the parameters, so each rank only holds its own slice of
-    # ``module.weight``; gather the full tensor before comparing.
-    if world > 1:
-        with model.full_state_dict_context():
-            state = model.state_dict()
-        weight, bias = state["weight"], state["bias"]
-    else:
-        weight, bias = module.weight.detach(), module.bias.detach()
+    # ``module.weight``; reassemble the global tensor before comparing.  FSDP2
+    # has no ``full_state_dict_context`` -- get_model_state_dict with
+    # full_state_dict=True is the replacement, and it is collective.
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+    state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
+    weight, bias = state["weight"], state["bias"]
     return {"rank": rank, "global_step": trainer.global_step, "applied": applied,
             "optimizer_steps": sum(applied),
-            "weight": weight.detach().flatten().tolist(),
-            "bias": bias.detach().flatten().tolist()}
+            "weight": _plain(weight.detach()).flatten().tolist(),
+            "bias": _plain(bias.detach()).flatten().tolist()}
+
+
+@case("trainer_fit_fsdp_clipping")
+def trainer_fit_fsdp_clipping(rank: int, world: int, dist, options: dict) -> dict:
+    """Drive ``grad_clip_norm`` through the real ``Trainer`` over FSDP2.
+
+    ``fsdp_grad_norm_is_global`` checks the ``clip_grad_norm_`` function.  This
+    case checks the **wiring**: ``run_optimizer_step`` has to hand it the sharded
+    module, at the point where DTensor gradients exist, and the reported norm has
+    to match what one process reports for the same data.  A function that is
+    right but called with the wrong object, or called before the accumulation
+    window closes, passes the first check and fails this one.
+
+    Both ranks are fed identical data, so the world_size=1 run of this same case
+    is a real reference: FSDP2's globally-reduced gradient equals the
+    single-process gradient, and the global norm -- hence the clip coefficient
+    and every weight -- must match exactly.  Unlike the accumulation case, this
+    one *does* discriminate: a shard-local norm is strictly smaller than the
+    global one, so the coefficients would differ and the weights would diverge.
+
+    The cap is deliberately small, and the reference's reported norms are
+    asserted to exceed it, so the run cannot pass without clipping having
+    actually taken place.
+    """
+    import torch
+    from torch import nn
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    cap = 0.05
+    torch.manual_seed(7)
+    module = nn.Linear(4, 4, bias=True)
+    values = {"grad_accumulation_steps": 1, "grad_clip_norm": cap}
+    if world > 1:
+        values["parallel"] = {"dp_size": world}
+        values["fsdp"] = {"enabled": True}
+    config = FrameworkConfig.from_dict(values)
+    runtime = Runtime(device="cpu", seed=7)
+    model = parallelize(module, config=config, runtime=runtime) if world > 1 else module
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = Trainer(model, optimizer, config=config, loss_fn=_squared_error,
+                      runtime=runtime)
+
+    trainer.fit([_batch(step, 0) for step in range(5)], epochs=1)
+    reported = [step.grad_norm for step in trainer.history]
+
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+    state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
+    return {"rank": rank, "cap": cap, "grad_norms": reported,
+            "optimizer_steps": trainer.optimizer_step,
+            "weight": _plain(state["weight"].detach()).flatten().tolist(),
+            "bias": _plain(state["bias"].detach()).flatten().tolist()}
 
 
 def _squared_error(output, batch):
@@ -409,8 +787,7 @@ def pp_pipeline_step(rank: int, world: int, dist, options: dict) -> dict:
 
     # Each rank holds only its own stage; world_size==1 holds everything.
     stage = model.module if hasattr(model, "module") else model
-    parameters = [value for parameter in stage.parameters()
-                  for value in parameter.detach().flatten().tolist()]
+    parameters = _flatten(stage)
     applied = [step.optimizer_step for step in trainer.history]
     losses = None
     if rank == world - 1:                 # only the last stage computes a loss
@@ -430,16 +807,38 @@ def _classification_batch(step: int):
 # --------------------------------------------------------------------------- #
 # Checkpointing -- the persistence path, at world_size > 1
 # --------------------------------------------------------------------------- #
+def _named_projector():
+    """A tiny model whose projections carry the names the TP plan matches on.
+
+    The checkpoint cases used an anonymous ``nn.Sequential``, which the plan
+    cannot name -- and ``parallelize`` now refuses an unnamed plan at ``tp_size>1``
+    rather than sharding nothing.  So a TP-able model has to name its
+    projections; that is a real requirement of the design, not a test detail.
+    """
+    from torch import nn
+
+    class Projector(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4)
+            self.activation = nn.ReLU()
+            self.o_proj = nn.Linear(4, 4)
+
+        def forward(self, value):
+            return self.o_proj(self.activation(self.q_proj(value)))
+
+    return Projector()
+
+
 def _checkpoint_model(world: int, options: dict):
     """The model the checkpoint cases train, in whichever sharding they ask for."""
     import torch
-    from torch import nn
 
     from aitrainer import FrameworkConfig, Runtime
     from aitrainer.parallelizer import parallelize
 
     torch.manual_seed(7)
-    module = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+    module = _named_projector()
     mode = options.get("mode", "fsdp")
     values: dict = {"grad_accumulation_steps": 1}
     if world > 1:
@@ -457,8 +856,21 @@ def _checkpoint_model(world: int, options: dict):
 
 
 def _flatten(model) -> list:
+    """Every parameter, flattened, as plain Python floats.
+
+    FSDP2 holds parameters as DTensors, and ``.tolist()`` refuses tensor
+    subclasses.  ``to_local()`` is the accessor that does not gather, which is
+    what a per-rank before/after comparison wants: it checks that *this rank's*
+    shard survived the round trip, and gathers nothing it would then have to
+    ignore.
+    """
     return [value for parameter in model.parameters()
-            for value in parameter.detach().flatten().tolist()]
+            for value in _plain(parameter.detach()).flatten().tolist()]
+
+
+def _plain(value):
+    """A DTensor's local shard; a plain tensor passes through unchanged."""
+    return value.to_local() if hasattr(value, "to_local") else value
 
 
 @case("checkpoint_roundtrip")
@@ -773,8 +1185,7 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
         batches.append((torch.randn(4, 8, generator=generator),
                         torch.randint(0, 4, (4,), generator=generator)))
     trainer.fit(batches, epochs=1)
-    before = [value for parameter in trainer.model.module.parameters()
-              for value in parameter.detach().flatten().tolist()]
+    before = _flatten(trainer.model.module)
 
     if rank == 0:
         shutil.rmtree(path, ignore_errors=True)
@@ -786,8 +1197,7 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
 
     trainer2 = build()
     restored = trainer2.load_sharded(path)
-    after = [value for parameter in trainer2.model.module.parameters()
-             for value in parameter.detach().flatten().tolist()]
+    after = _flatten(trainer2.model.module)
     dist.barrier()
     if rank == 0:
         shutil.rmtree(path, ignore_errors=True)
@@ -802,58 +1212,183 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
                         if len(before) == len(after) else float("inf")}
 
 
-@case("sharded_checkpoint_refuses_tp")
-def sharded_checkpoint_refuses_tp(rank: int, world: int, dist, options: dict) -> dict:
-    """``save_sharded`` must refuse a TP model rather than corrupt it.
+@case("sharded_roundtrip_by_axis")
+def sharded_roundtrip_by_axis(rank: int, world: int, dist, options: dict) -> dict:
+    """``save_sharded``/``load_sharded`` must round-trip TP and PP exactly.
 
-    ``get_model_state_dict`` understands FSDP and DDP; for anything else it
-    returns ``module.state_dict()``, the LOCAL tensor.  Under TP those differ per
-    rank, every rank writes its version under the same key, DCP keeps one, and
-    the load hands that one to everyone.
+    Both axes used to be *refused* by ``_reject_unsupported_sharding``, and the
+    reason was real: ``get_model_state_dict`` returned each rank's LOCAL tensor,
+    every rank wrote its version under one key, DCP kept one, and the load handed
+    that one to everybody.  Measured then at tp=2: two ranks with genuinely
+    different shards both came back holding rank 1's values, max|dW| = 5.5e-01.
 
-    Measured before the guard existed, at world_size=2/tp=2: two ranks with
-    genuinely different shards both came back holding rank 1's values,
-    max|dW| = 5.5e-01 -- and nothing reported a problem.
+    The two axes needed different repairs, which is the point of running them
+    through one case:
 
-    The check asserts the LOCAL shards really do differ first: if they matched,
-    the case would prove nothing about the guard.
+    * **TP** was fixed by making the parameters ``DTensor`` (Stage B).  DCP now
+      knows ``q_proj.weight`` is one tensor sharded over several ranks, so the
+      plain key is already unambiguous.
+    * **PP** was not fixed by that, and could not be: ``split_sequential`` wraps
+      each stage's layers in its own ``nn.Sequential``, so stage 0 and stage 1
+      both name their child ``0``.  Those are different tensors under one key,
+      and the failure is silent in both directions.  Measured at pp=2: after a
+      round trip each rank held the same tensor, neither one its own,
+      max|dW| = 6.4e-01.  ``checkpointing._stage_prefix`` namespaces the keys by
+      stage, which alone took it to 0.000e+00.
+
+    The worker first reports what makes the case non-vacuous: the per-rank
+    tensors must genuinely differ, and for PP the two stages must genuinely
+    collide on key names.
     """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
     import torch
+    from torch import nn
 
     from aitrainer import FrameworkConfig, Runtime, Trainer
-    from aitrainer.checkpoint import CheckpointError
     from aitrainer.parallelizer import parallelize
 
-    class Block(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.q_proj = torch.nn.Linear(8, 8)      # a declared column suffix
-            self.o_proj = torch.nn.Linear(8, 8)      # a declared row suffix
-        def forward(self, value):
-            return self.o_proj(torch.nn.functional.relu(self.q_proj(value)))
+    axis = options.get("axes", "tp")
 
-    torch.manual_seed(7)
+    class Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8)          # a declared column suffix
+            self.activation = nn.ReLU()
+            self.o_proj = nn.Linear(8, 8)          # a declared row suffix
+
+        def forward(self, value):
+            return self.o_proj(self.activation(self.q_proj(value)))
+
+    if axis == "tp":
+        values = {"parallel": {"tp_size": world}}
+    else:
+        values = {"parallel": {"pp_size": world, "pp_schedule": "gpipe",
+                               "num_microbatches": 2}}
+    config = FrameworkConfig.from_dict(values)
+    path = Path(tempfile.gettempdir()) / f"aitrainer-axes-{axis}-{os.environ.get('MASTER_PORT', '0')}"
+
+    def build():
+        # A fresh module each time: `parallelize` mutates in place, so reusing an
+        # object would shard an already-sharded model.
+        torch.manual_seed(7)
+        runtime = Runtime(device="cpu", seed=7)
+        model = parallelize(Block(), config=config, runtime=runtime)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        trainer = Trainer(model, optimizer, config=config, runtime=runtime,
+                          loss_fn=lambda output, batch: torch.nn.functional.mse_loss(
+                              output, batch[1]))
+        return trainer, model
+
+    trainer, _model = build()
+    generator = torch.Generator().manual_seed(31)
+    trainer.fit([(torch.randn(2, 8, generator=generator),
+                  torch.randn(2, 8, generator=generator)) for _ in range(2)], epochs=1)
+    trained = _flatten(trainer.model.module)
+    # `PipelineStage` exposes `parameters()` but not `named_parameters()`, and a
+    # PP rank holds only its own stage, so ask the inner module.
+    inner = trainer.model.module
+    keys = sorted(name for name, _ in (inner.module if hasattr(inner, "stage_id")
+                                       else inner).named_parameters())
+
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+    dist.barrier()
+    trainer.save_sharded(path)
+    dist.barrier()
+
+    trainer2, _ = build()
+    trainer2.load_sharded(path)
+    restored = _flatten(trainer2.model.module)
+
+    gathered: list = [None] * world
+    dist.all_gather_object(gathered, {"trained": trained, "keys": keys})
+    shards_differ = any(gathered[0]["trained"] != other["trained"] for other in gathered[1:])
+    keys_collide = all(gathered[0]["keys"] == other["keys"] for other in gathered[1:])
+    files = sorted(item.name for item in path.iterdir())
+    shards = sorted(name for name in os.listdir(path / "dcp") if name.endswith(".distcp"))
+    return {"rank": rank, "axis": axis, "written": files, "shards": shards,
+            "keys": keys, "keys_collide_across_ranks": keys_collide,
+            "per_rank_values_differ": shards_differ,
+            "max_diff": max(abs(a - b) for a, b in zip(trained, restored)),
+            "global_step": trainer2.global_step, "optimizer_step": trainer2.optimizer_step,
+            "optimizer_state_entries": len(list(trainer2.optimizer.state.values()))}
+
+
+@case("sharded_reshard_to_one_process")
+def sharded_reshard_to_one_process(rank: int, world: int, dist, options: dict) -> dict:
+    """The sharded checkpoint must be readable at a different world size.
+
+    This is what "真分片" buys and what the framework did not have: the old
+    refusal was documented as covering "换 world size 只能拒绝，不能转换".  Because
+    the saved tensors are globally described, DCP can hand the whole thing to a
+    single process with no process group at all (``no_dist=True``), which is a
+    simultaneous change of world size AND of TP layout.
+
+    ``get_model_state_dict(full_state_dict=True)`` is collective, so every rank
+    calls it -- calling it on rank 0 alone deadlocks the others at the next
+    barrier, which is exactly how the first version of this probe hung.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+    from torch import nn
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    class Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8)
+            self.activation = nn.ReLU()
+            self.o_proj = nn.Linear(8, 8)
+
+        def forward(self, value):
+            return self.o_proj(self.activation(self.q_proj(value)))
+
     config = FrameworkConfig.from_dict({"parallel": {"tp_size": world}})
+    path = Path(tempfile.gettempdir()) / f"aitrainer-reshard-{os.environ.get('MASTER_PORT', '0')}"
+    torch.manual_seed(7)
     runtime = Runtime(device="cpu", seed=7)
     model = parallelize(Block(), config=config, runtime=runtime)
     trainer = Trainer(model, torch.optim.AdamW(model.parameters(), lr=0.01),
-                      config=config, runtime=runtime)
+                      config=config, runtime=runtime,
+                      loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+    generator = torch.Generator().manual_seed(41)
+    trainer.fit([(torch.randn(2, 8, generator=generator),
+                  torch.randn(2, 8, generator=generator)) for _ in range(2)], epochs=1)
 
-    local = [value for parameter in model.parameters()
-             for value in parameter.detach().flatten().tolist()]
-    gathered: list = [None] * world
-    dist.all_gather_object(gathered, local)
-    shards_differ = any(gathered[0] != other for other in gathered[1:])
-    _require(shards_differ, "the local shards are identical; this case would prove nothing")
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+    dist.barrier()
+    trainer.save_sharded(path)
+    dist.barrier()
 
-    try:
-        trainer.save_sharded(f"/tmp/aitrainer-refuse-{rank}")
-    except CheckpointError as exc:
-        return {"rank": rank, "refused": True, "shards_differ": True,
-                "message": str(exc)[:200]}
-    raise AssertionError(
-        f"rank {rank}: save_sharded accepted a TP model; the load would hand every "
-        "rank the same shard")
+    # Collective: every rank must join, even though only rank 0 uses the result.
+    trained = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
+    result = {"rank": rank, "world": world, "loaded": False, "max_diff": None,
+              "shape": None, "keys": sorted(trained)}
+    if rank == 0:
+        import torch.distributed.checkpoint as dcp
+        dense = Block().state_dict()
+        dcp.load({"model": dense}, storage_reader=dcp.FileSystemReader(str(path / "dcp")),
+                 no_dist=True)
+        worst = max(float((dense[name].cpu() - trained[name].cpu()).abs().max())
+                    for name in trained)
+        result.update({"loaded": True, "max_diff": worst,
+                       "shape": list(dense["q_proj.weight"].shape),
+                       "shapes_match": all(tuple(dense[n].shape) == tuple(trained[n].shape)
+                                           for n in trained)})
+    dist.barrier()
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

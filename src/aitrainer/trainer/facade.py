@@ -16,6 +16,7 @@ from ..core.torch import require_torch
 from ..distributed_model import DistributedModel
 from ..offload import OffloadManager
 from ..overlap import OverlapController
+from ..parallel.fsdp import supports_gradient_sync
 from ..precision import autocast_context, validate_precision
 from ..runtime import Runtime
 from . import bootstrap, checkpointing, evaluation, loop, step
@@ -52,17 +53,22 @@ class Trainer:
         if self.runtime.world_size > 1 and self.config.parallel.dp_size > 1:
             # Only REPLICATED ranks need to reduce gradients together.  TP/PP with
             # dp_size == 1 has no replicas to diverge, and TP already reduces in the
-            # autograd collectives -- demanding no_sync there made the STABLE `tp`
-            # capability impossible to train through Trainer.  Inspect the layer
-            # that actually reduces, not the wrapper: DistributedModel.no_sync()
-            # degrades to nullcontext() when the module it wraps has none, so
+            # autograd collectives -- demanding gradient-sync control there made the
+            # STABLE `tp` capability impossible to train through Trainer.  Inspect the
+            # layer that actually reduces, not the wrapper: DistributedModel.no_sync()
+            # degrades to a no-op when the module it wraps has neither method, so
             # testing the wrapper let an unsynchronised model pass this guard.
+            #
+            # Both generations count.  FSDP1 and DDP answer to `no_sync`; FSDP2
+            # renamed it to `set_requires_gradient_sync`, and checking only the old
+            # name would reject every FSDP2 config at construction.
             wrapped = model.module if isinstance(model, DistributedModel) else model
-            if not hasattr(wrapped, "no_sync"):
+            if not supports_gradient_sync(wrapped):
                 raise ValueError(
-                    "dp_size>1 requires a model that reduces gradients (an FSDP-wrapped "
-                    "module): the given model has no no_sync, so each rank would step on "
-                    "its own divergent gradients. Set fsdp.enabled=True, or use dp_size=1 "
+                    "dp_size>1 requires a model that reduces gradients (an FSDP-sharded "
+                    "module): the given model exposes neither no_sync nor "
+                    "set_requires_gradient_sync, so each rank would step on its own "
+                    "divergent gradients. Set fsdp.enabled=True, or use dp_size=1 "
                     "with tp_size/pp_size for the non-replicated axes.")
         self.model = model if isinstance(model, DistributedModel) else DistributedModel(model)
         self.device = torch.device(device or self.runtime.state.device)

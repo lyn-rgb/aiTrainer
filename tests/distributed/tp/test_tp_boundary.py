@@ -4,8 +4,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from aitrainer import FrameworkConfig, validate
-from aitrainer.parallel.tp import ColumnParallelLinear, RowParallelLinear
+from aitrainer import FrameworkConfig, TransformerTPPlan, validate
+from aitrainer.parallel.tp import TPConfigurationError, device_mesh
 
 
 def test_tp_configuration_is_dp_pp_exclusive():
@@ -13,9 +13,22 @@ def test_tp_configuration_is_dp_pp_exclusive():
     validate(config, world_size=2)
 
 
-def test_tp_modules_construct_at_tp1():
-    column = ColumnParallelLinear(4, 8)
-    row = RowParallelLinear(8, 4)
-    value = torch.randn(2, 4)
-    assert column(value).shape == (2, 8)
-    assert row(column(value)).shape == (2, 4)
+def test_the_plan_covers_a_declared_transformer_block():
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(8, 8)
+            self.o_proj = torch.nn.Linear(8, 8)
+
+    styles = TransformerTPPlan().styles(Block())
+    assert sorted(styles) == ["o_proj", "q_proj"]
+
+
+def test_device_mesh_rejects_a_group_it_cannot_describe():
+    """Without a process group there is no mesh, and torch cannot invent one."""
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        pytest.skip("a process group is already initialized, so the guard cannot fire")
+    with pytest.raises(TPConfigurationError, match="process group"):
+        device_mesh(None)

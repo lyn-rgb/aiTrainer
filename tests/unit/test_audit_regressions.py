@@ -104,12 +104,14 @@ def test_apply_candidate_preserves_fields_it_does_not_name():
     config = FrameworkConfig(
         planning=PlanningConfig(enabled=True, allow_rewrite=True),
         parallel=ParallelConfig(dp_size=2, tp_size=2, pp_size=1, sp_backend="ulysses"),
-        fsdp=FSDPConfig(enabled=True, forward_prefetch=True, execution_trace_complete=True,
+        fsdp=FSDPConfig(enabled=True,
                         mixed_precision=MixedPrecisionConfig(enabled=True, dtype="float16")))
     updated = apply_candidate(config, PlanCandidate(4, 2, 1, "fsdp", 0.0, ("t",)))
     assert updated.parallel.sp_backend == "ulysses"
-    assert updated.fsdp.forward_prefetch is True
-    assert updated.fsdp.execution_trace_complete is True
+    # mixed_precision is the probe that survives: apply_candidate rebuilds
+    # FSDPConfig, and naming only `enabled` used to drop the nested config
+    # wholesale.  forward_prefetch/execution_trace_complete used to serve here
+    # too; both are gone with FSDP1.
     assert updated.fsdp.mixed_precision.enabled is True
     assert updated.fsdp.mixed_precision.dtype == "float16"
     assert updated.parallel.dp_size == 4

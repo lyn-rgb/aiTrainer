@@ -107,34 +107,34 @@ class MixedPrecisionConfig:
                 raise ConfigurationError(f"fsdp.mixed_precision.dtype={dtype!r} is not supported")
         elif "torch." not in str(dtype):
             # A real torch.dtype reprs as "torch.float16"; anything else is a
-            # mistake better caught here than inside FullyShardedDataParallel.
+            # mistake better caught here than inside fully_shard.
             raise ConfigurationError(f"fsdp.mixed_precision.dtype={dtype!r} is not a torch dtype")
 
 
 @dataclass(frozen=True)
 class FSDPConfig:
+    """The two FSDP2 knobs this framework actually forwards.
+
+    Five fields used to live here.  ``sharding`` was FSDP1's strategy enum
+    (FSDP2 shards a single way); ``limit_all_gathers`` and ``forward_prefetch``
+    were FSDP1 scheduler flags with no FSDP2 counterpart; and
+    ``execution_trace_complete`` existed only to gate ``forward_prefetch``.
+    None of them reached anything, so a config could set them and train
+    unsharded-and-unprefetched with no signal.  ``cpu_offload`` was the same
+    shape but louder -- it raised, and pointed at ``FrameworkConfig.offload``,
+    which is the mechanism that does exist.
+
+    ``MixedPrecisionPolicy`` has no ``buffer_dtype``, so it is not reachable
+    from here either; see ``parallel.fsdp``.
+    """
+
     enabled: bool = False
-    sharding: Literal["FULL_SHARD"] = "FULL_SHARD"
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
-    limit_all_gathers: bool = True
-    forward_prefetch: bool = False
-    execution_trace_complete: bool = False
-    cpu_offload: bool = False
 
     def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigurationError("fsdp.enabled must be bool")
         self.mixed_precision.validate()
-        if self.sharding != "FULL_SHARD":
-            raise ConfigurationError("fsdp.sharding must be 'FULL_SHARD'")
-        if self.cpu_offload:
-            raise ConfigurationError(
-                "fsdp.cpu_offload is not wired to the Batch 6 OffloadManager; "
-                "use FrameworkConfig.offload explicitly"
-            )
-        if self.forward_prefetch and not self.execution_trace_complete:
-            raise ConfigurationError(
-                "fsdp.forward_prefetch requires execution_trace_complete=True; "
-                "dynamic execution must not enable prefetch"
-            )
 
 
 @dataclass(frozen=True)

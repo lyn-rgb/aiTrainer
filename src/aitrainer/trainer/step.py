@@ -40,10 +40,12 @@ def run_optimizer_step(trainer: Any) -> tuple[float | None, bool]:
     cast_gradients(trainer.model.parameters(), trainer.config.precision.grad_dtype, torch_module=torch)
     grad_norm = None
     if trainer.config.grad_clip_norm is not None:
-        if hasattr(trainer.model.module, "clip_grad_norm_"):
-            value = trainer.model.module.clip_grad_norm_(trainer.config.grad_clip_norm)
-        else:
-            value = torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.config.grad_clip_norm)
+        # FSDP1 exposed `module.clip_grad_norm_`; FSDP2 does not, and
+        # `torch.distributed.fsdp.clip_grad_norm_` does not exist in torch 2.9.
+        # `parallel.fsdp.clip_grad_norm_` reduces the per-parameter DTensor norms
+        # itself: `torch.nn.utils` does not, and returns each shard's own norm.
+        from ..parallel.fsdp import clip_grad_norm_
+        value = clip_grad_norm_(trainer.model.module, trainer.config.grad_clip_norm)
         grad_norm = float(value.item())
     skipped = False
     if trainer.scaler.is_enabled():

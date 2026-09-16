@@ -92,16 +92,7 @@ from .overlap import (
                          ResourceBudget,
                          TransferScheduler,
 )
-from .parallel.collectives import (
-                         all_to_all_layout,
-                         copy_to_tp,
-                         gather_from_sequence,
-                         gather_from_tp,
-                         reduce_from_tp,
-                         scatter_to_sequence,
-                         scatter_to_tp,
-)
-from .parallel.fsdp import FSDPWrapper, fsdp_available, wrap_fsdp
+from .parallel.fsdp import clip_grad_norm_, no_gradient_sync, supports_gradient_sync, wrap_fsdp
 from .parallel.pp_p2p import P2PCommunicator, P2PError
 from .parallel.pp_schedule import (
                          GPipeSchedule,
@@ -118,9 +109,13 @@ from .parallel.pp_shapes import (
                          split_microbatches,
                          split_sequential,
 )
-from .parallel.sp_sequence import SequenceParallelLayerNorm, gather_sequence, scatter_sequence
-from .parallel.sp_ulysses import UlyssesAttention, distributed_attention
-from .parallel.tp import ColumnParallelLinear, RowParallelLinear
+from .parallel.sp_ulysses import UlyssesAttention, all_to_all_layout, distributed_attention
+from .parallel.tp import (
+                         TPConfigurationError,
+                         device_mesh,
+                         parallelize_tensor_parallel,
+                         sequence_parallel_styles,
+)
 from .parallelizer import parallelize
 from .planner import PlanCandidate, PlanningError, PlanReport, apply_candidate, suggest_plan
 from .plugins.models import (
@@ -167,7 +162,6 @@ __all__ = [
                          "CheckpointError",
                          "CheckpointManager",
                          "CheckpointSchemaError",
-                         "ColumnParallelLinear",
                          "CompileConfig",
                          "ConfigPreset",
                          "ConfigurationError",
@@ -177,7 +171,6 @@ __all__ = [
                          "DeviceMeshManager",
                          "ExecutionScheduler",
                          "FSDPConfig",
-                         "FSDPWrapper",
                          "FrameworkConfig",
                          "GPTAdapter",
                          "GPipeSchedule",
@@ -228,15 +221,14 @@ __all__ = [
                          "RankCoordinate",
                          "RankMapping",
                          "ResourceBudget",
-                         "RowParallelLinear",
                          "Runtime",
                          "RuntimeState",
                          "ScheduleOutput",
-                         "SequenceParallelLayerNorm",
                          "ShardSpec",
                          "StagePlan",
                          "StatefulSampler",
                          "StepOutput",
+                         "TPConfigurationError",
                          "TensorSpec",
                          "TinyTransformerAdapter",
                          "Topology",
@@ -255,36 +247,33 @@ __all__ = [
                          "capability_status",
                          "cast_gradients",
                          "cast_optimizer_state",
-                         "copy_to_tp",
+                         "clip_grad_norm_",
+                         "device_mesh",
                          "diagnose_exception",
                          "distributed_attention",
                          "dry_run",
                          "flash_attention_available",
-                         "fsdp_available",
                          "fused_adamw_step",
                          "fused_mlp",
-                         "gather_from_sequence",
-                         "gather_from_tp",
-                         "gather_sequence",
                          "inspect_checkpoint",
                          "inspect_hardware",
                          "inspect_topology",
                          "layer_norm",
                          "make_rank_mapping",
+                         "no_gradient_sync",
                          "normalize_loss",
                          "parallelize",
+                         "parallelize_tensor_parallel",
                          "plan_stages",
-                         "reduce_from_tp",
                          "residual_add",
                          "resolve_dtype",
                          "rms_norm",
                          "scaled_dot_product_attention",
-                         "scatter_sequence",
-                         "scatter_to_sequence",
-                         "scatter_to_tp",
+                         "sequence_parallel_styles",
                          "split_microbatches",
                          "split_sequential",
                          "suggest_plan",
+                         "supports_gradient_sync",
                          "validate",
                          "validate_capabilities",
                          "validate_precision",
