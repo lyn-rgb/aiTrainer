@@ -571,6 +571,9 @@ SHARDED_AXIS_MATRIX = [
     (4, {"dp": 2, "pp": 2}),
     (4, {"tp": 4, "sp": "megatron"}),
     (4, {"dp": 2, "tp": 2, "sp": "megatron"}),
+    (4, {"tp": 2, "pp": 2}),
+    (8, {"dp": 2, "tp": 2, "pp": 2}),
+    (8, {"dp": 2, "tp": 2, "pp": 2, "sp": "megatron"}),
 ]
 
 
@@ -615,33 +618,83 @@ def test_sharded_checkpoint_round_trips_axis_combinations(world, options):
             "every rank holds identical weights, so this case cannot detect a load "
             "that hands one rank's tensor to everybody")
     if options.get("pp", 1) > 1:
-        assert all(p["keys_collide_across_ranks"] for p in payloads), (
-            "PP stages no longer share key names, so the stage prefix is no longer "
-            "what makes this work -- the case has stopped testing it")
+        assert not any(p["keys_collide_across_ranks"] for p in payloads), (
+            "PP stages share checkpoint key names, so the same key means different "
+            "tensors on different ranks -- DCP would keep one and hand it to both, "
+            "which is what split_sequential used to cause by re-indexing every "
+            "stage's children from 0")
 
 
-def test_pp_plus_tp_is_refused_rather_than_silently_unsharded():
-    """Documents a real gap with the reason, so it is a known limit not a mystery.
+def test_every_rank_builds_the_same_model():
+    """``Runtime`` must not offset the seed by rank, or the ranks train different models.
 
-    ``pp=2, tp=2`` cannot work today: the PP split renames every stage's modules
-    to ``0, 1, ...``, so the suffix-based TP plan matches nothing.  The failure
-    is loud (``TPConfigurationError``), which is the improvement Stage B made --
-    the same call used to return successfully with tensor parallelism silently
-    switched off.
+    The global RNG is where a caller draws model initialisation from, and every
+    example in this repository -- and this class's own docstring -- creates the
+    ``Runtime`` *before* the model.  Offsetting the seed by rank therefore made
+    each rank build a different model: measured at world=2 as
+    ``torch.initial_seed() == 1234`` on rank 0 and ``1235`` on rank 1, with the
+    "same" model differing by max|dW| = 6.9e-01 before a single step.
+
+    Tensor parallelism hid it (``distribute_tensor`` broadcasts from
+    ``src_data_rank``, overwriting the difference) and FSDP hid it more
+    thoroughly (its all-gather reconstructs a parameter out of both ranks, so the
+    result is half-initialised from each).  Pipeline parallelism has neither,
+    which is where it surfaced.
+
+    Data sharding is the caller's job, so the offset bought nothing.
     """
-    payloads = require_success(run_case("sharded_roundtrip_axes", 4,
-                                        options={"tp": 2, "pp": 2},
-                                        hard_timeout=120.0))
-    for payload in payloads:
-        assert payload["ran"] is False
-        assert "names no module to shard" in payload["error"]
+    payloads = require_success(run_case("composition_train_matches_dense", 2,
+                                        options={"shape": "1,1,2"}, hard_timeout=180.0))
+    assert len({p["initial_seed"] for p in payloads}) == 1, (
+        "ranks disagree about the global seed, so they will build different models")
+    first = payloads[0]["before_parallelize"]
+    for payload in payloads[1:]:
+        assert payload["before_parallelize"] == first, (
+            "the same model built on two ranks came out different")
+
+
+@pytest.mark.parametrize(("world", "shape", "sp"), [
+    (2, "2,1,1", "none"),
+    (2, "1,2,1", "none"),
+    (2, "1,1,2", "none"),
+    (4, "1,2,2", "none"),
+    (4, "1,2,2", "megatron"),
+    (8, "2,2,2", "none"),
+    (8, "2,2,2", "megatron"),
+])
+def test_training_matches_a_single_process_on_every_axis(world, shape, sp):
+    """DP+TP+PP+SP together must TRAIN to the same weights as one process.
+
+    The checkpoint cases prove a round trip is lossless; this proves the
+    training itself is right.  Every rank gets identical data, so a DP reduction
+    over identical replicas is the identity and the world=1 run of the same case
+    is a valid reference.
+
+    The pipeline stages hold disjoint parameters, so their reported values are
+    concatenated in stage order before comparing -- which also checks that the
+    stage split put the right layers on the right rank.
+    """
+    reference = require_success(run_case("composition_train_matches_dense", 1,
+                                         options={"shape": "1,1,1"},
+                                         hard_timeout=120.0))[0]
+    payloads = require_success(run_case("composition_train_matches_dense", world,
+                                        options={"shape": shape, "sp": sp},
+                                        hard_timeout=300.0))
+    joined: list = []
+    for stage in sorted({p["stage"] for p in payloads}):
+        joined.extend(next(p["parameters"] for p in payloads if p["stage"] == stage))
+    assert len(joined) == len(reference["parameters"]), "the stages do not partition the model"
+    worst = max(abs(a - b) for a, b in zip(joined, reference["parameters"]))
+    assert worst < TOLERANCE, (
+        f"dp,tp,pp={shape} sp={sp} trained to different weights than one process "
+        f"(max|diff| = {worst:.3e})")
 
 
 def test_sharded_checkpoint_reshards_to_a_single_process():
     """The sharded checkpoint must be readable at a different world size.
 
     This is what "真分片" is for, and the framework did not have it: the old
-    documentation recorded "换 world size 只能拒绝，不能转换". Because the saved
+    documentation recorded "换 world size 只能拒绝，不能转换".  Because the saved
     tensors are globally described, DCP can hand the whole thing to a single
     process with **no process group at all** (``no_dist=True``) -- a simultaneous
     change of world size *and* of TP layout.
@@ -658,3 +711,33 @@ def test_sharded_checkpoint_reshards_to_a_single_process():
     assert reader["shape"] == [8, 8], "the tensor did not come back at its global shape"
     assert reader["shapes_match"] is True, (
         "at least one tensor's shape differs between the dense and the sharded view")
+
+
+def test_pipeline_stages_keep_their_module_names():
+    """The fix that lets pp and tp compose, pinned directly.
+
+    ``split_sequential`` used to wrap each stage's children in an
+    ``nn.Sequential``, which renames them by position.  Two things broke, both
+    silently: a name-matching TP plan found nothing on a stage (so pp+tp ran
+    with tensor parallelism switched off, or was refused once the plan became
+    name-based), and every stage's checkpoint keys started at ``"0"``, so stage
+    0's ``0.weight`` and stage 1's ``0.weight`` were different tensors under one
+    key.  The reindexing is gone, so a stage now reports the caller's own names.
+
+    The checkpoint side of the same property is asserted by
+    ``test_sharded_checkpoint_round_trips_axis_combinations``; this asserts the
+    names, which is what makes both work.
+    """
+    payloads = require_success(run_case("sharded_roundtrip_axes", 4,
+                                        options={"tp": 2, "pp": 2}, hard_timeout=180.0))
+    names = [set(p["keys"]) for p in payloads]
+    for keys in names:
+        assert keys, "the stage reported no parameters at all"
+        assert not any(key.split(".")[0].rstrip("0123456789") == "" for key in keys), (
+            f"stage children are named by position again: {sorted(keys)}")
+    assert names[0] != names[-1], (
+        "both stages report the same parameter names, so the stages were "
+        "re-indexed rather than keeping their original module names")
+    for payload in payloads:
+        assert payload["ran"] is True, payload.get("error")
+        assert payload["max_diff"] == 0.0

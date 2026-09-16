@@ -67,7 +67,27 @@ class Runtime:
                                   initialized_process_group=owns_group)
         self._closed = False
         self._owns_process_group = owns_group
-        seed_everything(seed + self.state.rank, deterministic=deterministic)
+        # NOT `seed + rank`.  The rank offset looked like the usual trick for
+        # giving each rank different data, and it is the wrong tool for that
+        # here: this seeds the *global* RNG, which is where a caller draws model
+        # initialisation from.  So every rank built a different model.
+        #
+        # Measured at world=2 with `Runtime` created before the model -- which is
+        # what this class's own docstring recommends and what every example in
+        # this repository does -- `torch.initial_seed()` was 1234 on rank 0 and
+        # 1235 on rank 1, and the "same" model differed by max|dW| = 6.9e-01
+        # before a single step was taken.
+        #
+        # Two things hid it.  Tensor parallelism broadcasts parameters from
+        # ``src_data_rank``, which overwrites the difference; FSDP's all-gather
+        # reconstructs a parameter out of both ranks, so the result was a model
+        # half-initialised from each -- correct-looking, and wrong.  Pipeline
+        # parallelism has neither, so it is where the difference showed up.
+        #
+        # Data sharding is the caller's job (see ``seed_everything``), so the
+        # offset bought nothing to set against that.  At rank 0 this is
+        # unchanged, including every single-process run.
+        seed_everything(seed, deterministic=deterministic)
         self._set_device()
 
     @staticmethod

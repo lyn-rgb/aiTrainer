@@ -1212,6 +1212,93 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
                         if len(before) == len(after) else float("inf")}
 
 
+@case("composition_train_matches_dense")
+def composition_train_matches_dense(rank: int, world: int, dist, options: dict) -> dict:
+    """Train through ``Trainer.fit`` on every axis at once, against a dense reference.
+
+    The checkpoint cases prove a round trip is lossless; this proves the
+    *training* on the compounded axes is numerically right.  Every rank gets the
+    same data, so a DP reduction over identical replicas is the identity on the
+    gradient and the single-process run of this same case is a valid reference:
+    TP/SP must reproduce it exactly, and the pipeline stages' parameters,
+    concatenated in stage order, must equal the whole model's.
+
+    ``options["shape"]`` is ``dp,tp,pp`` (``sp`` optional), so the same case
+    covers ``tp=2,pp=2`` and, at world 8, ``dp=2,tp=2,pp=2`` with and without SP.
+    """
+    import torch
+    from torch import nn
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    parts = options.get("shape", "1,1,1").split(",")
+    dp, tp, pp = (int(part) for part in parts)
+    sp = options.get("sp", "none")
+
+    class Unit(nn.Module):
+        def __init__(self, hidden: int) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(hidden)
+            self.q_proj = nn.Linear(hidden, hidden)
+            self.o_proj = nn.Linear(hidden, hidden)
+
+        def forward(self, value):
+            return self.o_proj(torch.relu(self.q_proj(self.norm(value))))
+
+    class Block(nn.Module):
+        def __init__(self, hidden: int = 8) -> None:
+            super().__init__()
+            self.unit0 = Unit(hidden)
+            self.unit1 = Unit(hidden)
+            self.unit2 = Unit(hidden)
+            self.unit3 = Unit(hidden)
+
+        def forward(self, value):
+            for unit in (self.unit0, self.unit1, self.unit2, self.unit3):
+                value = unit(value)
+            return value
+
+    values = {"parallel": {"dp_size": dp, "tp_size": tp, "pp_size": pp, "sp_backend": sp},
+              "grad_accumulation_steps": 1,
+              "fsdp": {"enabled": dp > 1}}
+    if pp > 1:
+        values["parallel"]["pp_schedule"] = "gpipe"
+        values["parallel"]["num_microbatches"] = 2
+    config = FrameworkConfig.from_dict(values)
+    torch.manual_seed(1234)
+    probe_before = float(torch.randn(1).item())
+    runtime = Runtime(device="cpu", init_process_group=False, seed=1234)
+    probe_after = float(torch.randn(1).item())
+    block = Block()
+    before_parallelize = [value for param in block.parameters()
+                          for value in param.detach().flatten().tolist()]
+    model = parallelize(block, config=config, runtime=runtime) if world > 1 else block
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    trainer = Trainer(model, optimizer, config=config, runtime=runtime,
+                      loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+    generator = torch.Generator().manual_seed(88)
+    data = [(torch.randn(2, 4, 8, generator=generator),
+             torch.randn(2, 4, 8, generator=generator)) for _ in range(2)]
+    def snapshot() -> list:
+        return [value for p in trainer.model.module.parameters()
+                for value in _full(p.detach()).flatten().tolist()]
+
+    initial = snapshot()
+    trainer.fit(data, epochs=1)
+    return {"rank": rank, "shape": options.get("shape"), "sp": sp,
+            "stage": getattr(trainer.model.module, "stage_id", 0),
+            "initial": initial, "parameters": snapshot(),
+            "names": [name for name, _ in (
+                trainer.model.module.module
+                if hasattr(trainer.model.module, "stage_id") else trainer.model.module
+            ).named_parameters()],
+            "probe_before": probe_before, "probe_after": probe_after,
+            "before_parallelize": before_parallelize,
+            "initial_seed": torch.initial_seed(),
+            "optimizer_steps": trainer.optimizer_step}
+
+
 @case("sharded_roundtrip_axes")
 def sharded_roundtrip_axes(rank: int, world: int, dist, options: dict) -> dict:
     """Round-trip a sharded checkpoint over any combination of the four axes.
@@ -1236,28 +1323,48 @@ def sharded_roundtrip_axes(rank: int, world: int, dist, options: dict) -> dict:
     pp = int(options.get("pp", 1))
     sp = options.get("sp", "none")
 
-    class Block(nn.Module):
-        """Four top-level children, in the arrangement the TP styles assume.
+    class Unit(nn.Module):
+        """One norm + col->row pair: the smallest self-contained TP unit.
 
-        q/k/v are column projections and each consumes the *replicated* input;
-        o_proj is the row projection that consumes their sharded output.  A
-        column projection must NOT feed another column projection: the second
-        one receives the first's local shard and torch's style annotates a plain
-        tensor as Replicate, so the shapes then disagree by the TP factor
-        (measured: (2, 4) against (8, 8)).  That fails loudly, which is why this
-        fixture uses the Megatron arrangement rather than a chain.
+        The ``nn.LayerNorm`` is load-bearing for the SP tests.  Without a norm
+        ``sequence_parallel_styles`` returns an empty dict, so ``sp_backend`` had
+        nothing to act on and a "tp+sp" case would have been passing vacuously
+        with SP silently off.
+        """
+
+        def __init__(self, hidden: int) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(hidden)
+            self.q_proj = nn.Linear(hidden, hidden)   # column
+            self.o_proj = nn.Linear(hidden, hidden)   # row
+
+        def forward(self, value):
+            return self.o_proj(torch.relu(self.q_proj(self.norm(value))))
+
+    class Block(nn.Module):
+        """Four top-level children, each a complete col->row pair.
+
+        The pairing has to stay *inside* a stage.  A column projection emits a
+        sharded activation, and only its paired row projection can consume that
+        -- across a pipeline boundary the activation is a full tensor, so a row
+        projection on the far side would treat it as a shard.  Measured: putting
+        the column and its row in different stages deadlocks inside ``fit``
+        (Gloo recv timeout at the barrier after it), rather than failing a
+        shape check.  Nesting one pair per child keeps every split point valid
+        for pp up to 4.
         """
 
         def __init__(self, hidden: int = 8) -> None:
             super().__init__()
-            self.q_proj = nn.Linear(hidden, hidden)
-            self.k_proj = nn.Linear(hidden, hidden)
-            self.v_proj = nn.Linear(hidden, hidden)
-            self.o_proj = nn.Linear(hidden, hidden)
+            self.unit0 = Unit(hidden)
+            self.unit1 = Unit(hidden)
+            self.unit2 = Unit(hidden)
+            self.unit3 = Unit(hidden)
 
         def forward(self, value):
-            joined = self.q_proj(value) + self.k_proj(value) + self.v_proj(value)
-            return self.o_proj(torch.relu(joined))
+            for unit in (self.unit0, self.unit1, self.unit2, self.unit3):
+                value = unit(value)
+            return value
 
     values = {"parallel": {"dp_size": dp, "tp_size": tp, "pp_size": pp, "sp_backend": sp},
               "fsdp": {"enabled": dp > 1}}

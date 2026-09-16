@@ -13,13 +13,56 @@ from ..core.batching import (
     normalize_loss,
     split_microbatches,
 )
+from ..core.torch import module_base
 
 # `normalize_loss` and `split_microbatches` now live in core.batching; they are
 # re-exported here because this module is where callers have always imported
 # them from.  The list is load-bearing: without it ruff reads the imports as
 # unused and deletes them.
-__all__ = ["PipelineShapeError", "StagePlan", "TensorSpec", "normalize_loss",
-           "plan_stages", "split_microbatches", "split_sequential"]
+__all__ = ["PipelineSequence", "PipelineShapeError", "StagePlan", "TensorSpec",
+           "normalize_loss", "plan_stages", "split_microbatches", "split_sequential"]
+
+# Must be an expression at import time: the class below inherits from it.
+ModuleBase, nn = module_base()
+
+
+class PipelineSequence(ModuleBase):
+    """Run a list of named children in order, **keeping their original names**.
+
+    ``nn.Sequential`` renames its children by position, and this split used to
+    build one per stage.  Two consequences followed, neither of them an error:
+
+    * a name-matching TP plan (``q_proj``, ``o_proj``, ...) finds nothing on a
+      pipeline stage, so ``pp`` and ``tp`` could not be combined at all.  That
+      is now a loud ``TPConfigurationError``, but it is a gap either way;
+    * every stage's checkpoint keys start at ``"0"``, so stage 0's ``0.weight``
+      and stage 1's ``0.weight`` are *different tensors under one key*.  DCP
+      keeps one and hands it to both -- measured at pp=2 as a round trip that
+      returned each rank the same tensor, neither one its own, max|dW| = 6.4e-01,
+      with save and load both reporting success.
+
+    Both come from the same re-indexing, so fixing it here fixes both.  The
+    ordering contract is unchanged: children still run in their original order,
+    which is the assumption ``split_sequential`` always carried (a model whose
+    ``forward`` is not a plain chain is not splittable by this function, before
+    or after).
+    """
+
+    def __init__(self, named_layers: Sequence[tuple[str, Any]]) -> None:
+        if nn is None:  # type: ignore[truthy-function]
+            raise ImportError("PipelineSequence requires PyTorch")
+        super().__init__()
+        self.layer_names: list[str] = []
+        for name, layer in named_layers:
+            # Names come from named_children(), so they are non-empty and
+            # contain no ".", which is all add_module requires.
+            self.add_module(name, layer)
+            self.layer_names.append(name)
+
+    def forward(self, value: Any) -> Any:
+        for name in self.layer_names:
+            value = getattr(self, name)(value)
+        return value
 
 
 @dataclass(frozen=True)
@@ -109,9 +152,14 @@ def plan_stages(layers: Sequence[Any], pp_size: int, *, policy: str = "uniform_l
 
 def split_sequential(module: Any, pp_size: int, *, policy: str = "uniform_layers",
                      sample: Any = None) -> tuple[Any, tuple[StagePlan, ...]]:
-    """Split a module with an ordered ``children()`` contract into stages."""
-    from torch import nn
-    layers = list(module.children())
+    """Split a module with an ordered ``named_children()`` contract into stages.
+
+    The split **keeps the original module names** (see :class:`PipelineSequence`),
+    which is what lets a name-matching TP plan address a pipeline stage and what
+    keeps each stage's checkpoint keys distinct.
+    """
+    named = list(module.named_children())
+    layers = [layer for _, layer in named]
     plans = plan_stages(layers, pp_size, policy=policy, sample=sample)
-    stages = tuple(nn.Sequential(*layers[p.start:p.stop]) for p in plans)
+    stages = tuple(PipelineSequence(named[p.start:p.stop]) for p in plans)
     return stages, plans

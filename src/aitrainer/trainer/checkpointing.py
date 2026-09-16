@@ -35,35 +35,6 @@ def load_checkpoint(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any
     return state
 
 
-def _stage_prefix(trainer: Any) -> str:
-    """The key namespace this rank's checkpoint entries belong to.
-
-    A saved key has to identify one tensor across every rank taking part in the
-    collective.  Tensor parallelism does that for free now -- the parameters are
-    ``DTensor``, so DCP knows ``q_proj.weight`` is *one* tensor sharded over
-    several ranks.  Pipeline parallelism does not: ``split_sequential`` wraps
-    each stage's layers in its own ``nn.Sequential``, so every stage names its
-    children ``0``, ``1``, ... and stage 0's ``0.weight`` and stage 1's
-    ``0.weight`` are different tensors under one key.  DCP keeps one and hands
-    it to both, and *both the save and the load report success*.
-
-    Measured at world=2, pp=2: after a save/load round trip each rank held the
-    same tensor, neither one its own, with max|dW| = 6.4e-01 against its trained
-    weights.  Making the keys unique per stage -- nothing else -- gives an exact
-    round trip (0.000e+00).
-
-    So the prefix is required exactly when there is more than one stage, which
-    is a statement about key uniqueness rather than a configuration switch: with
-    one stage, ``0.weight`` is already unique and the unprefixed layout is kept,
-    so single-stage checkpoints are unchanged.
-    """
-    parallel = getattr(getattr(trainer, "config", None), "parallel", None)
-    if int(getattr(parallel, "pp_size", 1) or 1) <= 1:
-        return ""
-    stage = getattr(getattr(trainer, "model", None), "module", None)
-    return f"stage.{int(getattr(stage, 'stage_id', 0) or 0)}."
-
-
 def _stateful_module(model: Any) -> Any:
     """The object torch's distributed state-dict helpers should be handed.
 
@@ -101,12 +72,11 @@ def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
     module = _stateful_module(trainer.model)
     trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
     trainer.offload.drain(trainer.optimizer)
-    prefix = _stage_prefix(trainer)
     state = {
-        f"{prefix}model": get_model_state_dict(module),
-        f"{prefix}optimizer": get_optimizer_state_dict(module, trainer.optimizer),
-        f"{prefix}bookkeeping": torch.tensor([trainer.global_step, trainer.optimizer_step],
-                                             dtype=torch.int64),
+        "model": get_model_state_dict(module),
+        "optimizer": get_optimizer_state_dict(module, trainer.optimizer),
+        "bookkeeping": torch.tensor([trainer.global_step, trainer.optimizer_step],
+                                    dtype=torch.int64),
     }
     CheckpointManager(runtime=trainer.runtime).save_dcp(
         path, state=state,
@@ -135,16 +105,15 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
     module = _stateful_module(trainer.model)
     trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
     trainer.offload.drain(trainer.optimizer)
-    prefix = _stage_prefix(trainer)
     state = {
-        f"{prefix}model": get_model_state_dict(module),
-        f"{prefix}optimizer": get_optimizer_state_dict(module, trainer.optimizer),
-        f"{prefix}bookkeeping": torch.zeros(2, dtype=torch.int64),
+        "model": get_model_state_dict(module),
+        "optimizer": get_optimizer_state_dict(module, trainer.optimizer),
+        "bookkeeping": torch.zeros(2, dtype=torch.int64),
     }
     metadata = CheckpointManager(runtime=trainer.runtime).load_dcp(path, state=state)
-    set_model_state_dict(module, state[f"{prefix}model"])
-    set_optimizer_state_dict(module, trainer.optimizer, state[f"{prefix}optimizer"])
-    trainer.global_step = int(state[f"{prefix}bookkeeping"][0].item())
-    trainer.optimizer_step = int(state[f"{prefix}bookkeeping"][1].item())
+    set_model_state_dict(module, state["model"])
+    set_optimizer_state_dict(module, trainer.optimizer, state["optimizer"])
+    trainer.global_step = int(state["bookkeeping"][0].item())
+    trainer.optimizer_step = int(state["bookkeeping"][1].item())
     return {"global_step": trainer.global_step, "optimizer_step": trainer.optimizer_step,
             "metadata": metadata}
