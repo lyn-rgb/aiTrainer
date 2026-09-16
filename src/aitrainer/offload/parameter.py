@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,14 +65,63 @@ class ParameterOffloader:
             master = data.detach().to(device="cpu").clone()
         self._records[key] = _ParameterRecord(parameter, master, buffer_key=buffer_key)
 
+    @staticmethod
+    def _parameter_names(module: Any) -> tuple[str, ...]:
+        """Parameter names of ``module`` itself, not of its descendants.
+
+        ``named_parameters`` recurses by default, so asking a parent for its own
+        names would fold every child's in as well and each layer would be
+        recorded once per ancestor it has.
+        """
+        named = getattr(module, "named_parameters", None)
+        if not callable(named):
+            return ()
+        return tuple(name for name, _ in named(recurse=False))
+
+    def _descendants(self, module: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
+        """Fully qualified descendants, depth-first, each yielded once.
+
+        Qualified, not local: ``named_children`` calls the norm inside ``b0`` and
+        the one inside ``b1`` both ``norm``, so a trace of local names cannot tell
+        those two positions apart -- swapping them would leave the digest
+        unchanged while the model changed.
+
+        ``_module_ids`` exists for the shared case: a submodule used from two
+        parents would otherwise be recorded twice, and a plan built from that
+        trace would prefetch it twice.
+        """
+        for name, child in getattr(module, "named_children", lambda: ())():
+            if id(child) in self._module_ids:
+                continue
+            self._module_ids.add(id(child))
+            qualified = f"{prefix}{name}"
+            yield qualified, child
+            yield from self._descendants(child, f"{qualified}.")
+
     def register_module(self, module: Any) -> int:
-        count = 0
-        for parameter in _parameters(module):
-            before = len(self._records)
-            self.register(parameter)
-            count += len(self._records) - before
+        """Register every parameter under ``module``, one trace entry per child.
+
+        The trace is what a prefetch plan is built from, so its granularity bounds
+        the plan's: registering the whole model records ONE entry, and a digest
+        over one entry says nothing about layer order -- which measured as a
+        single ``TraceEntry(module='Blk', ...)`` for a two-layer model.
+
+        Entries carry parameter NAMES.  They used to carry ``str(id(p))``, and an
+        id is a memory address: two runs of the same model produced different
+        digests (measured), so ``finalize(expected=<the warmup digest>)`` could
+        never match and the prefetch gate could never open.  Names are stable
+        across runs and are legible in the error a mismatch raises.
+        """
         self._module_ids.add(id(module))
-        self.trace.record(module.__class__.__qualname__, tuple(str(id(p)) for p in _parameters(module)))
+        count = 0
+        roots = [(module.__class__.__qualname__, module)]
+        roots.extend(self._descendants(module))
+        for name, target in roots:
+            for parameter in _parameters(target):
+                before = len(self._records)
+                self.register(parameter)
+                count += len(self._records) - before
+            self.trace.record(name, self._parameter_names(target))
         return count
 
     def _record(self, parameter: Any) -> _ParameterRecord:
@@ -109,21 +158,88 @@ class ParameterOffloader:
         """
         return self.fetch(module=module, device=device)
 
+    @staticmethod
+    def _copy_event() -> Any:
+        """A marker for the copies just issued, or None where that means nothing.
+
+        On CUDA an event recorded on the current stream completes when the
+        non-blocking copies ahead of it have landed.  On CPU the copies are
+        already done and there is nothing to wait for, so the caller gets None
+        and :meth:`_synchronize` skips it -- same code path, no branch at the
+        call site.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
+                return event
+        except ImportError:                                   # pragma: no cover
+            pass
+        return None
+
+    @staticmethod
+    def _synchronize(pending: Any) -> None:
+        for event in pending or ():
+            if event is not None:
+                event.synchronize()
+
+    def _target_device(self, module: Any, device: Any | None) -> Any:
+        if device is not None:
+            return device
+        for parameter in _parameters(module):
+            return getattr(parameter, "device", None)
+        return None
+
     def prefetch_async(self, module: Any, *, device: Any | None = None) -> Any:
-        """Submit a trace-validated fetch while retaining a synchronous fallback."""
-        if not self.trace.valid:
-            self.fetch(module=module, device=device)
+        """Start staging this module NOW and return a handle to wait on.
+
+        The point is the timing.  This used to store the fetch as a closure on
+        ``op.handle`` with ``op._wait_fn = lambda fn: fn()``, so the copy ran when
+        the consumer waited -- a deferred fetch, not an early one, and it hid
+        nothing.  The copy is now issued here and ``wait()`` only synchronizes.
+
+        Two ways it declines, and both fetch synchronously instead of returning
+        a handle the caller would read as "staged": the trace gate is closed
+        (unvalidated access order), or the coordinator refuses for budget
+        (:attr:`max_prefetched_bytes`).  The second used to return None without
+        fetching anything, leaving the parameters on the host with nothing
+        raised.
+
+        Contract: the returned handle must be waited before the module runs.
+        ``parameter.data`` is repointed at the destination tensor immediately,
+        and with ``non_blocking`` copies the contents are still in flight.
+        """
+        target = self._target_device(module, device)
+        if str(target) == "cpu":
+            # Nothing to stage: the master copy is already where it would go.
+            self.fetch(module=module, device=target)
             return None
-        def fetch_module() -> int:
-            return self.fetch(module=module, device=device)
-        # A module-level operation keeps the complete parameter set alive until
-        # the consumer explicitly waits; the coordinator owns the handle.
+        if not self.trace.valid:
+            self.fetch(module=module, device=target)
+            return None
         key = "module:" + str(id(module))
         op = self.trace.fetch(key, bytes_=sum(tensor_bytes(p) for p in _parameters(module)))
         if op is None:
+            self.fetch(module=module, device=target)
             return None
-        op.handle = fetch_module
-        op._wait_fn = lambda fn: fn()
+        pending: list[Any] = []
+        for item in _parameters(module):
+            record = self._record(item)
+            if str(getattr(item, "device", "cpu")) == str(target):
+                record.fetched = True
+                record.device = target
+                continue
+            master = record.master
+            # Pinning is what makes this genuinely asynchronous: a pageable
+            # source makes torch fall back to a blocking copy (correct, just not
+            # overlapped).  The master comes from the pinned pool when one is
+            # configured, so whether this overlaps is decided at registration.
+            item.data = master.to(device=target, non_blocking=True)
+            pending.append(self._copy_event())
+            record.fetched = True; record.device = target
+        op.handle = pending
+        op._wait_fn = self._synchronize
         return op
 
     def release(self, parameter: Any | None = None, module: Any | None = None) -> int:

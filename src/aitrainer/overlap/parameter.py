@@ -22,10 +22,43 @@ class ParameterPrefetchCoordinator:
     def __init__(self, *, max_prefetched_bytes: int = 0, scheduler: ExecutionScheduler | None = None, fetch_fn: Callable[[str], Any] | None = None) -> None:
         self.max_prefetched_bytes = max(0, max_prefetched_bytes); self.scheduler = scheduler or ExecutionScheduler(); self.fetch_fn = fetch_fn; self.trace: list[TraceEntry] = []; self._fingerprint: TraceFingerprint | None = None; self.valid = False; self._inflight: dict[str, AsyncOp] = {}; self._prefetched_bytes = 0; self.hits = self.misses = self.late = self.evicted = 0
     def record(self, module: str, parameters: list[str] | tuple[str, ...], *, step: int = 0, phase: str = "forward", recompute: bool = False) -> None: self.trace.append(TraceEntry(module, tuple(parameters), step, phase, recompute))
-    def fingerprint(self, config: Any = None) -> TraceFingerprint:
-        payload = {"trace": [e.__dict__ for e in self.trace], "config": repr(config)}; value = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(); self._fingerprint = TraceFingerprint(value); return self._fingerprint
+    def fingerprint(self) -> TraceFingerprint:
+        """A digest of the recorded access order, and nothing else.
+
+        ``finalize`` recomputes this and compares, so the two calls MUST agree on
+        what feeds the digest.  It used to take a ``config`` argument defaulting
+        to None, which is exactly the shape that breaks: the caller computed
+        ``fingerprint(config)`` while ``finalize`` recomputed
+        ``fingerprint(None)``, so ``repr(None)`` never equalled ``repr(config)``
+        and ``finalize(expected=...)`` returned False for every input -- leaving
+        ``valid`` permanently False and ``prefetch_async`` permanently degraded
+        to its synchronous branch.  Nothing caught it because ``fingerprint`` had
+        no caller but ``finalize``, and every test called ``finalize()`` with no
+        argument, which skips the comparison entirely.
+
+        The config is not needed in the digest either: a configuration change
+        that does not alter the access order does not invalidate a prefetch plan,
+        and one that does alter it changes the trace.  The argument was a knob
+        with no consumer, and it disabled the mechanism it was added to.
+        """
+        payload = [entry.__dict__ for entry in self.trace]
+        value = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        self._fingerprint = TraceFingerprint(value)
+        return self._fingerprint
+
     def finalize(self, expected: TraceFingerprint | str | None = None) -> bool:
-        fp = self.fingerprint(); self.valid = expected is None or fp.value == (expected.value if isinstance(expected, TraceFingerprint) else expected); return self.valid
+        """Adopt the recorded order as the plan, checking it against ``expected``.
+
+        ``expected`` is normally the digest of an earlier, un-prefetched pass:
+        record a warmup run, fingerprint it, and from then on finalize against
+        that digest.  A mismatch means the access order moved (dynamic control
+        flow, a changed model), and the coordinator goes back to synchronous
+        fetches rather than prefetching the wrong layer.
+        """
+        fp = self.fingerprint()
+        self.valid = expected is None or fp.value == (
+            expected.value if isinstance(expected, TraceFingerprint) else expected)
+        return self.valid
     def invalidate(self) -> None:
         self.valid = False
         for name in tuple(self._inflight): self.release(name)

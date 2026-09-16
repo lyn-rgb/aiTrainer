@@ -93,7 +93,14 @@ def capability_matrix() -> tuple[Capability, ...]:
         Capability("tp_bulk_overlap", CapabilityStatus.EXPERIMENTAL,
                    "pure PyTorch AG/RS bulk overlap with synchronous CPU/Gloo fallback", "tp"),
         Capability("parameter_prefetch", CapabilityStatus.EXPERIMENTAL,
-                   "trace-validated parameter fetch/prefetch with bounded residency", "offload_parameter"),
+                   "the mechanism works: the trace digest is stable across runs, "
+                   "prefetch_async issues its copy before returning, and a budget "
+                   "refusal falls back to a synchronous fetch. What is still "
+                   "missing is the per-layer DRIVER -- Trainer fetches and releases "
+                   "the whole model around a step, so nothing calls prefetch_async "
+                   "or finalize, and a per-layer plan would also have to agree with "
+                   "backward, where the same parameters are needed again",
+                   "offload_parameter"),
         Capability("pp_p2p_overlap", CapabilityStatus.EXPERIMENTAL,
                    "the async-send half is wired and the 1F1B path issues it "
                    "unconditionally, so this switch has nothing left to control -- it "
