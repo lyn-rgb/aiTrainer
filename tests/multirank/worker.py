@@ -555,6 +555,173 @@ def checkpoint_dcp_roundtrip(rank: int, world: int, dist, options: dict) -> dict
             shutil.rmtree(directory, ignore_errors=True)
 
 
+@case("sharded_convert_and_load")
+def sharded_convert_and_load(rank: int, world: int, dist, options: dict) -> dict:
+    """Dense -> sharded manifest -> per-rank load, over a live process group.
+
+    Covers the two entry points that make sharded loading possible and that only
+    ever had single-process tests: ``CheckpointConverter.convert`` and
+    ``ModelLoader.load_for_rank``.  Both are library-level; nothing in ``src/``
+    calls either, and ``Trainer``'s own checkpoint path writes a full replica on
+    every rank instead.  Verified here at pp=0/tp/dp coordinates so the claims
+    about it are reproducible rather than one-off probes.
+
+    ``partition_dims`` is the only thing that splits a tensor, and the split is
+    always along the **TP** axis: the converter chunks by ``effective_tp`` and
+    never by dp.  ``dp_size`` controls replica fan-out instead -- the same shard
+    is written into every dp rank's file.  That is faithful to what DP means
+    (replicas hold the same logical parameters), but it means a dp-only
+    conversion saves no space, and ``convert(source, dest, world_size=N)`` with
+    no explicit sizes means **tp=N**.  Asserting the recorded
+    ``logical_sharding`` and the file contents is what keeps those two facts from
+    being assumed rather than checked.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer.checkpoint import CheckpointConverter
+    from aitrainer.checkpoint.reader import ModelLoader
+
+    root = Path(tempfile.gettempdir()) / f"aitrainer-shard-{os.environ.get('MASTER_PORT', '0')}"
+    source = root / "dense.pt"
+    destination = root / "sharded"
+
+    if rank == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        torch.manual_seed(5)
+        # `w` is named in partition_dims and gets split; `b` is not, and stays
+        # full size in every rank's file -- the converter's actual contract.
+        torch.save({"w": torch.randn(8, 4), "b": torch.randn(8)}, source)
+    dist.barrier()
+
+    if rank == 0:
+        CheckpointConverter(partition_dims={"w": 0}).convert(
+            source, destination, world_size=world, tp_size=world)
+    dist.barrier()
+
+    reference = torch.load(source, map_location="cpu", weights_only=False)
+    local = {"w": torch.zeros(8 // world, 4), "b": torch.zeros(8)}
+    stats = ModelLoader().load_for_rank(destination / "manifest.json", local,
+                                        world_size=world, tp_rank=rank)
+
+    half = 8 // world
+    expected = reference["w"][rank * half:(rank + 1) * half]
+    _require(torch.equal(local["w"], expected),
+             f"rank {rank} did not receive ref[{rank * half}:{(rank + 1) * half}]")
+    _require(torch.equal(local["b"], reference["b"]),
+             "an unpartitioned tensor must arrive full-size on every rank")
+
+    manifest = ModelLoader().read_manifest(destination / "manifest.json")
+    shard_files = sorted({Path(shard.source_file).name
+                          for shards in manifest.tensors.values() for shard in shards})
+    return {"rank": rank, "stats": stats,
+            "logical_sharding": dict(manifest.logical_sharding),
+            "shard_files": shard_files,
+            "w_shape": list(local["w"].shape), "b_shape": list(local["b"].shape)}
+
+
+@case("sharded_convert_replicates_along_dp")
+def sharded_convert_replicates_along_dp(rank: int, world: int, dist, options: dict) -> dict:
+    """``dp_size`` fans out copies; it does not shard.
+
+    Worth pinning because the name suggests otherwise.  With ``tp_size=1`` and
+    ``dp_size=2`` every rank's file holds the WHOLE tensor, so a dp-only
+    conversion gives no storage saving -- which follows from what DP means, but
+    is not what a reader of ``--dp-size`` would guess.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer.checkpoint import CheckpointConverter
+    from aitrainer.checkpoint.reader import ModelLoader
+
+    root = Path(tempfile.gettempdir()) / f"aitrainer-dp-{os.environ.get('MASTER_PORT', '0')}"
+    source = root / "dense.pt"
+    destination = root / "converted"
+    if rank == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        torch.manual_seed(5)
+        torch.save({"w": torch.randn(8, 4)}, source)
+    dist.barrier()
+    if rank == 0:
+        CheckpointConverter(partition_dims={"w": 0}).convert(
+            source, destination, world_size=world, dp_size=world, tp_size=1)
+    dist.barrier()
+
+    reference = torch.load(source, map_location="cpu", weights_only=False)
+    local = {"w": torch.zeros(8, 4)}
+    ModelLoader().load_for_rank(destination / "manifest.json", local,
+                                world_size=world, dp_rank=rank)
+    return {"rank": rank, "shape": list(local["w"].shape),
+            "matches_whole_tensor": bool(torch.equal(local["w"], reference["w"]))}
+
+
+@case("sharded_load_rejects_a_foreign_coordinate")
+def sharded_load_rejects_a_foreign_coordinate(rank: int, world: int, dist, options: dict) -> dict:
+    """Asking for coordinates the manifest never addressed must fail loudly.
+
+    The dangerous alternative is silent: the model keeps its random
+    initialisation while the load reports success.  ``load_for_rank`` raises
+    ``KeyError`` for that case -- distinct from a tensor this stage simply does
+    not own, which is skipped -- and this pins the difference.
+
+    ``(pp, tp, dp)`` is positional, so ``dp_rank=N`` on a tp-sharded manifest
+    asks for a tuple nothing targets.  Note the converse trap this test would
+    fall into if written carelessly: on rank 0, ``dp_rank=0`` is the SAME tuple
+    as ``tp_rank=0``, so it legitimately matches.  The foreign coordinate has to
+    be one no spec uses.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer.checkpoint import CheckpointConverter
+    from aitrainer.checkpoint.reader import ModelLoader
+
+    root = Path(tempfile.gettempdir()) / f"aitrainer-foreign-{os.environ.get('MASTER_PORT', '0')}"
+    source = root / "dense.pt"
+    destination = root / "sharded"
+    if rank == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        torch.manual_seed(5)
+        torch.save({"w": torch.randn(8, 4)}, source)
+    dist.barrier()
+    if rank == 0:
+        CheckpointConverter(partition_dims={"w": 0}).convert(source, destination, world_size=world)
+    dist.barrier()
+
+    manifest = ModelLoader().read_manifest(destination / "manifest.json")
+    targets = sorted({shard.target_rank for shards in manifest.tensors.values() for shard in shards})
+    foreign = (0, 0, 1)                 # manifest addresses tp ranks; dp=1 targets nothing
+    _require(foreign not in targets,
+             f"the chosen coordinate {foreign} is a real target in {targets}; "
+             "this case would prove nothing")
+    try:
+        ModelLoader().load_for_rank(destination / "manifest.json",
+                                    {"w": torch.zeros(8 // world, 4)},
+                                    world_size=world, dp_rank=foreign[2])
+    except KeyError as exc:
+        return {"rank": rank, "refused": True, "targets": targets,
+                "message": str(exc)[:160]}
+    raise AssertionError(
+        f"rank {rank}: foreign coordinate {foreign} loaded without complaint; the "
+        "model would have kept its random initialisation")
+
+
 # --------------------------------------------------------------------------- #
 def _tp_group(world: int, rank: int):
     from aitrainer.parallel.groups import ProcessGroups

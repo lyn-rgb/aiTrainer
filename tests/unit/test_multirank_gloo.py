@@ -270,3 +270,64 @@ def test_dcp_save_keeps_every_rank_shard():
             "a shard or the .metadata file was destroyed by another rank's publish")
         assert payload["metadata"]["world"] == 2
         assert payload["max_diff"] == 0.0, "DCP round-trip did not restore the tensor"
+
+
+def test_sharded_convert_and_load_across_ranks():
+    """Dense -> sharded manifest -> per-rank load, over a live process group.
+
+    ``CheckpointConverter.convert`` and ``ModelLoader.load_for_rank`` are the two
+    entry points that make sharded loading possible, and both only ever had
+    single-process tests.  Nothing in ``src/`` calls either -- ``Trainer`` writes
+    a full replica on every rank -- so this is the only place their multi-rank
+    behaviour is checked at all.
+
+    The halves must be complementary and correct: the worker asserts each rank's
+    tensor equals ``ref[rank*half:(rank+1)*half]``, which is what distinguishes
+    real sharding from a load that quietly hands everyone the same thing.
+    """
+    for payload in require_success(run_case("sharded_convert_and_load", 2, hard_timeout=120.0)):
+        assert payload["stats"]["tensors_loaded"] == 2
+        assert payload["w_shape"] == [4, 4], "the partitioned tensor must arrive as a shard"
+        assert payload["b_shape"] == [8], "an unpartitioned tensor stays full-size"
+        assert len(payload["shard_files"]) == 2
+
+
+def test_convert_records_the_axis_it_actually_sharded():
+    """A bare ``world_size=N`` means tp=N, and the manifest must say so.
+
+    This caught a real surprise: ``convert(source, dest, world_size=2)`` shards
+    along TP, so loading with ``dp_rank=1`` fails.  Asserting the recorded
+    ``logical_sharding`` keeps the default from being assumed rather than known.
+    """
+    for payload in require_success(run_case("sharded_convert_and_load", 2, hard_timeout=120.0)):
+        assert payload["logical_sharding"] == {"dp": 1, "pp": 1, "tp": 2}
+
+
+def test_dp_axis_replicates_rather_than_shards():
+    """``dp_size`` fans copies out; it never splits a tensor.
+
+    The converter chunks by ``effective_tp`` only.  So a dp-only conversion gives
+    no storage saving -- faithful to what DP replicas are, but not what a reader
+    of the argument name would guess, and worth pinning rather than discovering
+    from a full disk.
+    """
+    for payload in require_success(run_case("sharded_convert_replicates_along_dp", 2,
+                                            hard_timeout=120.0)):
+        assert payload["shape"] == [8, 4], "dp must not split the tensor"
+        assert payload["matches_whole_tensor"] is True
+
+
+def test_loading_a_foreign_coordinate_is_refused():
+    """A rank nothing addresses must raise, not silently keep its init.
+
+    The failure mode this guards is quiet: the model keeps random weights while
+    the load reports success.  The worker first checks that the coordinate it
+    asks for is genuinely absent from the manifest's targets -- on rank 0,
+    ``dp_rank=0`` is the same tuple as ``tp_rank=0`` and would legitimately
+    match, so a carelessly chosen "foreign" coordinate proves nothing.
+    """
+    for payload in require_success(run_case("sharded_load_rejects_a_foreign_coordinate", 2,
+                                            hard_timeout=120.0)):
+        assert payload["refused"] is True
+        assert "would keep its random initialisation" in payload["message"]
+        assert [0, 0, 1] not in payload["targets"]
