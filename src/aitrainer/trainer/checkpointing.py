@@ -77,13 +77,26 @@ def _rng_state() -> dict[str, Any]:
 
     import torch
     version, internal, gauss = random.getstate()
-    return {
+    state = {
         "torch": torch.get_rng_state(),
         "python_version": torch.tensor([int(version)], dtype=torch.int64),
         "python_internal": torch.tensor([int(word) for word in internal], dtype=torch.int64),
         "python_gauss": torch.tensor([float("nan") if gauss is None else float(gauss)],
                                      dtype=torch.float64),
     }
+    if torch.cuda.is_available():
+        # The per-rank format has always stored these (``_torch_rng_state`` in
+        # checkpoint/manager.py); this path stored only the CPU generator, so on
+        # a GPU box a resumed run drew different dropout masks than the run it
+        # resumed -- and a CPU-only host cannot see it, because
+        # ``is_available()`` is False and there is no CUDA generator to miss.
+        #
+        # Stacked into one (devices, bytes) tensor: every device's state is the
+        # same length for a given torch build, so this keeps the fixed shape DCP
+        # needs, and the device count is the same on the save and the load of one
+        # checkpoint.
+        state["cuda"] = torch.stack([item.cpu() for item in torch.cuda.get_rng_state_all()])
+    return state
 
 
 def _restore_rng(state: Mapping[str, Any]) -> None:
@@ -92,6 +105,8 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
 
     import torch
     torch.set_rng_state(state["torch"].cpu())
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([row.cpu() for row in state["cuda"]])
     gauss = float(state["python_gauss"][0])
     random.setstate((int(state["python_version"][0]),
                      tuple(int(word) for word in state["python_internal"].tolist()),

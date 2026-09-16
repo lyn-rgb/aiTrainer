@@ -423,3 +423,37 @@ def test_flatten_keys_matches_torch(tmp_path):
         assert ours == theirs, (
             f"{label}: _flatten_keys disagrees with torch's traversal "
             f"(ours {sorted(ours)}, torch {sorted(theirs)})")
+
+
+def test_sharded_rng_carries_the_cuda_generators(monkeypatch):
+    """A GPU resume has to restore the CUDA generator, not just the CPU one.
+
+    The per-rank format always stored both (``_torch_rng_state`` in
+    ``checkpoint/manager.py``); the sharded path stored only the CPU generator
+    and Python's, so on a GPU box a resumed run drew different dropout masks than
+    the run that wrote the checkpoint -- and a CPU-only host cannot see it,
+    because ``is_available()`` is False and there is simply no CUDA generator to
+    miss.  That is why this is a structural test: with no accelerator here, the
+    observable facts are which calls happen.  The numbers can only be checked on
+    a GPU box -- see the GPU verification checklist in docs/代码审计报告.md.
+    """
+    import torch
+
+    from aitrainer.trainer.checkpointing import _restore_rng, _rng_state
+
+    wanted = [torch.arange(8, dtype=torch.uint8), torch.arange(8, dtype=torch.uint8) + 1]
+    applied: list = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [row.clone() for row in wanted])
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all",
+                        lambda states: applied.append([row.tolist() for row in states]))
+
+    state = _rng_state()
+    assert "cuda" in state, (
+        "the CUDA generators were not saved, so a GPU resume diverges from the run "
+        "it resumed and nothing says so")
+    assert tuple(state["cuda"].shape) == (2, 8), "one row per device, stacked"
+
+    _restore_rng(state)
+    assert applied == [[row.tolist() for row in wanted]], (
+        "the saved CUDA state was never handed back to torch")

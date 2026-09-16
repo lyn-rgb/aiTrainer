@@ -5,9 +5,12 @@ adapter protocols, a reproducible trainer, portable checkpoints, and explicit
 FSDP / TP / SP / PP / offload interfaces with conservative capability boundaries.
 
 **Architecture**: [`docs/架构.md`](docs/架构.md) has the layered module map and
-the dependency contracts that CI enforces. `docs/路线图.md` and
-`docs/开发方案与开发规划.md` describe a *target* state, not the code as it stands;
-`docs/代码审计报告.md` records the defect history and what was verified empirically.
+the dependency contracts that CI enforces.
+[`docs/GPU验证清单.md`](docs/GPU验证清单.md) lists what cannot be settled on a
+CPU/Gloo host and how to check it on a real one.
+`docs/路线图.md` and `docs/开发方案与开发规划.md` describe a *target* state, not
+the code as it stands; `docs/代码审计报告.md` records the defect history and what
+was verified empirically.
 
 ```bash
 pip install -e .

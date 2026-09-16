@@ -310,7 +310,13 @@ def checkpoint_random_state(rank: int, world: int, dist, report: Report, options
     trainer.fit([(torch.randn(2, 8), torch.randn(2, 8))], epochs=1)
     # Both streams: torch's, and Python's -- the latter advances inside `fit`
     # whenever the provider or the model draws from `random`.
-    expected = [torch.randn(3).tolist(), random.random()]
+    # Drawn on the training DEVICE, not on CPU.  A CPU-only draw cannot see a
+    # CUDA generator: on a GPU box the sharded checkpoint restored the CPU and
+    # Python streams while silently dropping the CUDA one, and this check drew
+    # from torch.randn on CPU and reported success.  Picking the device makes the
+    # same check cover whichever generator the run actually uses.
+    device = trainer.device
+    expected = [torch.randn(3, device=device).tolist(), random.random()]
 
     if rank == 0:
         shutil.rmtree(path, ignore_errors=True)
@@ -331,8 +337,8 @@ def checkpoint_random_state(rank: int, world: int, dist, report: Report, options
         torch.manual_seed(991)                   # deliberately move the stream
         random.seed(991)
         getattr(trainer, load)(target)
-        results[name] = [float((torch.tensor(torch.randn(3).tolist())
-                                - torch.tensor(expected[0])).abs().max()),
+        results[name] = [float((torch.randn(3, device=device) - torch.tensor(
+            expected[0], device=device)).abs().max()),
                          abs(random.random() - expected[1])]
     if rank == 0:
         for name, label in (("per_rank", "save_checkpoint/load_checkpoint"),
