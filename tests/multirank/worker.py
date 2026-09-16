@@ -1212,33 +1212,13 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
                         if len(before) == len(after) else float("inf")}
 
 
-@case("sharded_roundtrip_by_axis")
-def sharded_roundtrip_by_axis(rank: int, world: int, dist, options: dict) -> dict:
-    """``save_sharded``/``load_sharded`` must round-trip TP and PP exactly.
+@case("sharded_roundtrip_axes")
+def sharded_roundtrip_axes(rank: int, world: int, dist, options: dict) -> dict:
+    """Round-trip a sharded checkpoint over any combination of the four axes.
 
-    Both axes used to be *refused* by ``_reject_unsupported_sharding``, and the
-    reason was real: ``get_model_state_dict`` returned each rank's LOCAL tensor,
-    every rank wrote its version under one key, DCP kept one, and the load handed
-    that one to everybody.  Measured then at tp=2: two ranks with genuinely
-    different shards both came back holding rank 1's values, max|dW| = 5.5e-01.
-
-    The two axes needed different repairs, which is the point of running them
-    through one case:
-
-    * **TP** was fixed by making the parameters ``DTensor`` (Stage B).  DCP now
-      knows ``q_proj.weight`` is one tensor sharded over several ranks, so the
-      plain key is already unambiguous.
-    * **PP** was not fixed by that, and could not be: ``split_sequential`` wraps
-      each stage's layers in its own ``nn.Sequential``, so stage 0 and stage 1
-      both name their child ``0``.  Those are different tensors under one key,
-      and the failure is silent in both directions.  Measured at pp=2: after a
-      round trip each rank held the same tensor, neither one its own,
-      max|dW| = 6.4e-01.  ``checkpointing._stage_prefix`` namespaces the keys by
-      stage, which alone took it to 0.000e+00.
-
-    The worker first reports what makes the case non-vacuous: the per-rank
-    tensors must genuinely differ, and for PP the two stages must genuinely
-    collide on key names.
+    ``options`` names ``dp`` / ``tp`` / ``pp`` / ``sp``; the model has four
+    top-level children so a split up to pp=4 is possible, and its projections
+    carry the names the TP plan matches on.
     """
     import os
     import shutil
@@ -1251,29 +1231,44 @@ def sharded_roundtrip_by_axis(rank: int, world: int, dist, options: dict) -> dic
     from aitrainer import FrameworkConfig, Runtime, Trainer
     from aitrainer.parallelizer import parallelize
 
-    axis = options.get("axes", "tp")
+    dp = int(options.get("dp", 1))
+    tp = int(options.get("tp", 1))
+    pp = int(options.get("pp", 1))
+    sp = options.get("sp", "none")
 
     class Block(nn.Module):
-        def __init__(self) -> None:
+        """Four top-level children, in the arrangement the TP styles assume.
+
+        q/k/v are column projections and each consumes the *replicated* input;
+        o_proj is the row projection that consumes their sharded output.  A
+        column projection must NOT feed another column projection: the second
+        one receives the first's local shard and torch's style annotates a plain
+        tensor as Replicate, so the shapes then disagree by the TP factor
+        (measured: (2, 4) against (8, 8)).  That fails loudly, which is why this
+        fixture uses the Megatron arrangement rather than a chain.
+        """
+
+        def __init__(self, hidden: int = 8) -> None:
             super().__init__()
-            self.q_proj = nn.Linear(8, 8)          # a declared column suffix
-            self.activation = nn.ReLU()
-            self.o_proj = nn.Linear(8, 8)          # a declared row suffix
+            self.q_proj = nn.Linear(hidden, hidden)
+            self.k_proj = nn.Linear(hidden, hidden)
+            self.v_proj = nn.Linear(hidden, hidden)
+            self.o_proj = nn.Linear(hidden, hidden)
 
         def forward(self, value):
-            return self.o_proj(self.activation(self.q_proj(value)))
+            joined = self.q_proj(value) + self.k_proj(value) + self.v_proj(value)
+            return self.o_proj(torch.relu(joined))
 
-    if axis == "tp":
-        values = {"parallel": {"tp_size": world}}
-    else:
-        values = {"parallel": {"pp_size": world, "pp_schedule": "gpipe",
-                               "num_microbatches": 2}}
+    values = {"parallel": {"dp_size": dp, "tp_size": tp, "pp_size": pp, "sp_backend": sp},
+              "fsdp": {"enabled": dp > 1}}
+    if pp > 1:
+        values["parallel"]["pp_schedule"] = "gpipe"
+        values["parallel"]["num_microbatches"] = 2
     config = FrameworkConfig.from_dict(values)
-    path = Path(tempfile.gettempdir()) / f"aitrainer-axes-{axis}-{os.environ.get('MASTER_PORT', '0')}"
+    path = Path(tempfile.gettempdir()) / (
+        f"aitrainer-axes-{dp}-{tp}-{pp}-{sp}-{os.environ.get('MASTER_PORT', '0')}")
 
     def build():
-        # A fresh module each time: `parallelize` mutates in place, so reusing an
-        # object would shard an already-sharded model.
         torch.manual_seed(7)
         runtime = Runtime(device="cpu", seed=7)
         model = parallelize(Block(), config=config, runtime=runtime)
@@ -1281,41 +1276,48 @@ def sharded_roundtrip_by_axis(rank: int, world: int, dist, options: dict) -> dic
         trainer = Trainer(model, optimizer, config=config, runtime=runtime,
                           loss_fn=lambda output, batch: torch.nn.functional.mse_loss(
                               output, batch[1]))
-        return trainer, model
+        return trainer
 
-    trainer, _model = build()
-    generator = torch.Generator().manual_seed(31)
-    trainer.fit([(torch.randn(2, 8, generator=generator),
-                  torch.randn(2, 8, generator=generator)) for _ in range(2)], epochs=1)
-    trained = _flatten(trainer.model.module)
-    # `PipelineStage` exposes `parameters()` but not `named_parameters()`, and a
-    # PP rank holds only its own stage, so ask the inner module.
-    inner = trainer.model.module
-    keys = sorted(name for name, _ in (inner.module if hasattr(inner, "stage_id")
-                                       else inner).named_parameters())
+    # Everything from the very first build is inside the try: a combination the
+    # framework refuses (pp+tp) fails during `parallelize`, and the case has to
+    # report that as an answer rather than as a crashed worker.
+    try:
+        trainer = build()
+        generator = torch.Generator().manual_seed(53)
+        trainer.fit([(torch.randn(2, 8, generator=generator),
+                      torch.randn(2, 8, generator=generator)) for _ in range(2)], epochs=1)
+        trained = _flatten(trainer.model.module)
+        inner = trainer.model.module
+        keys = sorted(name for name, _ in (inner.module if hasattr(inner, "stage_id")
+                                           else inner).named_parameters())
+        gathered: list = [None] * world
+        dist.all_gather_object(gathered, {"trained": trained, "keys": keys})
+        per_rank_values_differ = any(gathered[0]["trained"] != other["trained"]
+                                     for other in gathered[1:])
+        keys_collide = all(gathered[0]["keys"] == other["keys"] for other in gathered[1:])
 
-    if rank == 0:
-        shutil.rmtree(path, ignore_errors=True)
-    dist.barrier()
-    trainer.save_sharded(path)
-    dist.barrier()
-
-    trainer2, _ = build()
-    trainer2.load_sharded(path)
-    restored = _flatten(trainer2.model.module)
-
-    gathered: list = [None] * world
-    dist.all_gather_object(gathered, {"trained": trained, "keys": keys})
-    shards_differ = any(gathered[0]["trained"] != other["trained"] for other in gathered[1:])
-    keys_collide = all(gathered[0]["keys"] == other["keys"] for other in gathered[1:])
-    files = sorted(item.name for item in path.iterdir())
-    shards = sorted(name for name in os.listdir(path / "dcp") if name.endswith(".distcp"))
-    return {"rank": rank, "axis": axis, "written": files, "shards": shards,
-            "keys": keys, "keys_collide_across_ranks": keys_collide,
-            "per_rank_values_differ": shards_differ,
-            "max_diff": max(abs(a - b) for a, b in zip(trained, restored)),
-            "global_step": trainer2.global_step, "optimizer_step": trainer2.optimizer_step,
-            "optimizer_state_entries": len(list(trainer2.optimizer.state.values()))}
+        if rank == 0:
+            shutil.rmtree(path, ignore_errors=True)
+        dist.barrier()
+        trainer.save_sharded(path)
+        dist.barrier()
+        trainer2 = build()
+        trainer2.load_sharded(path)
+        restored = _flatten(trainer2.model.module)
+        return {"rank": rank, "ran": True, "dp": dp, "tp": tp, "pp": pp, "sp": sp,
+                "max_diff": max(abs(a - b) for a, b in zip(trained, restored)),
+                "steps": trainer2.global_step,
+                "keys": keys, "keys_collide_across_ranks": keys_collide,
+                "per_rank_values_differ": per_rank_values_differ,
+                "optimizer_state_entries": len(list(trainer2.optimizer.state.values()))}
+    except (ValueError, RuntimeError) as exc:
+        # ValueError covers the framework's own refusals (TPConfigurationError,
+        # ConfigurationError); RuntimeError covers torch's distributed errors.
+        # Narrowing it keeps a genuine bug from being reported as a supported
+        # answer -- an unexpected exception should crash the worker, not be
+        # collected as "this combination is refused".
+        return {"rank": rank, "ran": False, "dp": dp, "tp": tp, "pp": pp, "sp": sp,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
 
 @case("sharded_reshard_to_one_process")

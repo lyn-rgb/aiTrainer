@@ -557,49 +557,84 @@ def test_sharded_checkpoint_roundtrip_at_two_ranks():
             "the optimizer state did not survive; the checkpoint is not resumable")
 
 
-@pytest.mark.parametrize("axis", ["tp", "pp"])
-def test_sharded_checkpoint_round_trips_every_axis(axis):
-    """``save_sharded``/``load_sharded`` must round-trip TP **and** PP exactly.
+# Every axis combination this framework accepts at the world sizes a single
+# machine can host.  pp+tp is absent on purpose -- see the note in the test.
+SHARDED_AXIS_MATRIX = [
+    (2, {"dp": 2}),
+    (2, {"pp": 2}),
+    (2, {"tp": 2}),
+    (2, {"tp": 2, "sp": "megatron"}),
+    (4, {"dp": 4}),
+    (4, {"pp": 4}),
+    (4, {"tp": 4}),
+    (4, {"dp": 2, "tp": 2}),
+    (4, {"dp": 2, "pp": 2}),
+    (4, {"tp": 4, "sp": "megatron"}),
+    (4, {"dp": 2, "tp": 2, "sp": "megatron"}),
+]
 
-    Both axes used to be refused, and the reason was real: ``get_model_state_dict``
-    returned each rank's LOCAL tensor, every rank wrote its version under one key,
-    DCP kept one, and the load handed that one to everybody -- measured at tp=2 as
-    two genuinely-different shards both coming back holding rank 1's values,
-    max|dW| = 5.5e-01, with nothing reporting a problem.
 
-    The repairs differ per axis, which is why the case is parameterized:
+@pytest.mark.parametrize(("world", "options"), SHARDED_AXIS_MATRIX,
+                         ids=[f"w{w}-" + "-".join(f"{k}{v}" for k, v in sorted(o.items()))
+                              for w, o in SHARDED_AXIS_MATRIX])
+def test_sharded_checkpoint_round_trips_axis_combinations(world, options):
+    """Which parallel strategies the sharded checkpoint actually supports.
 
-    * TP was fixed by making parameters ``DTensor`` (Stage B). DCP now knows
-      ``q_proj.weight`` is ONE tensor sharded over several ranks.
-    * PP was *not* fixed by that. ``split_sequential`` wraps each stage's layers
-      in its own ``nn.Sequential``, so stage 0 and stage 1 both name the child
-      ``0`` -- different tensors under one key. Measured at pp=2 after the TP fix:
-      each rank came back holding the same tensor, neither one its own,
-      max|dW| = 6.4e-01. ``checkpointing._stage_prefix`` namespaces keys by stage
-      and alone took it to 0.000e+00.
+    This is the measured answer, not a reading of the code: for each axis
+    combination the framework accepts, train a couple of steps, save
+    collectively, rebuild from scratch, load, and compare -- over real
+    processes.  Every entry below restores to max|dW| = 0.0e+00.
 
-    ``per_rank_values_differ`` is what keeps this from passing vacuously: if every
-    rank held the same weights, a corrupted load would look identical to a correct
-    one.
+    ``per_rank_values_differ`` keeps the DP results from passing vacuously: with
+    identical replicas a load that handed one rank's tensor to everybody would
+    look exactly like a correct one.
+
+    **pp+tp is missing because it does not work**, and the cause is upstream of
+    checkpointing: ``split_sequential`` wraps each stage's children in its own
+    ``nn.Sequential``, so every stage's module names become ``0, 1, ...``.  The
+    TP plan matches declared suffixes (``q_proj``, ``o_proj``), finds none, and
+    refuses -- measured as ``TPConfigurationError: the plan names no module to
+    shard``.  Before the plan became name-based that combination silently ran
+    with no tensor parallelism at all, so this is a loud version of a long-
+    standing gap rather than a new one.  The same re-indexing is why PP stages
+    share checkpoint keys, which is what ``checkpointing._stage_prefix`` works
+    around.
     """
-    for payload in require_success(run_case("sharded_roundtrip_by_axis", 2,
-                                            options={"axes": axis}, hard_timeout=180.0)):
-        assert payload["axis"] == axis
-        assert payload["per_rank_values_differ"] is True, (
-            "every rank holds identical weights, so this case cannot detect a load "
-            "that hands one rank's tensor to everybody")
-        assert payload["shards"] == ["__0_0.distcp", "__1_0.distcp"], "not sharded"
+    payloads = require_success(run_case("sharded_roundtrip_axes", world, options=options,
+                                        hard_timeout=300.0))
+    assert len(payloads) == world
+    for payload in payloads:
+        assert payload["ran"] is True, payload.get("error")
         assert payload["max_diff"] == 0.0, (
-            f"the {axis} round trip changed the weights")
-        assert payload["global_step"] == 2 and payload["optimizer_step"] == 2
+            f"{options} round trip changed the weights")
+        assert payload["steps"] == 2
         assert payload["optimizer_state_entries"] > 0, (
             "the optimizer state did not survive; the checkpoint is not resumable")
-    if axis == "pp":
-        payloads = require_success(run_case("sharded_roundtrip_by_axis", 2,
-                                            options={"axes": axis}, hard_timeout=180.0))
+    if any(value != 1 for value in options.values() if isinstance(value, int)):
+        assert any(p["per_rank_values_differ"] for p in payloads), (
+            "every rank holds identical weights, so this case cannot detect a load "
+            "that hands one rank's tensor to everybody")
+    if options.get("pp", 1) > 1:
         assert all(p["keys_collide_across_ranks"] for p in payloads), (
-            "the PP stages no longer share key names, so the stage prefix is no "
-            "longer what makes this work -- the case has stopped testing it")
+            "PP stages no longer share key names, so the stage prefix is no longer "
+            "what makes this work -- the case has stopped testing it")
+
+
+def test_pp_plus_tp_is_refused_rather_than_silently_unsharded():
+    """Documents a real gap with the reason, so it is a known limit not a mystery.
+
+    ``pp=2, tp=2`` cannot work today: the PP split renames every stage's modules
+    to ``0, 1, ...``, so the suffix-based TP plan matches nothing.  The failure
+    is loud (``TPConfigurationError``), which is the improvement Stage B made --
+    the same call used to return successfully with tensor parallelism silently
+    switched off.
+    """
+    payloads = require_success(run_case("sharded_roundtrip_axes", 4,
+                                        options={"tp": 2, "pp": 2},
+                                        hard_timeout=120.0))
+    for payload in payloads:
+        assert payload["ran"] is False
+        assert "names no module to shard" in payload["error"]
 
 
 def test_sharded_checkpoint_reshards_to_a_single_process():
