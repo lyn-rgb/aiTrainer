@@ -47,3 +47,67 @@ def test_dense_converter_partitions_pp_when_the_assignment_is_given(tmp_path):
     stage0 = torch.load(destination / "rank_00000.pt", weights_only=False)
     stage1 = torch.load(destination / "rank_00004.pt", weights_only=False)
     assert "weight" not in stage0 and "weight" in stage1
+
+
+def test_stage_assignment_is_derived_from_the_same_split_training_uses():
+    """The mapping ``convert`` needs must come from the model, not from the caller.
+
+    ``convert`` refused ``pp_size>1`` without a mapping, and the reason was
+    sound -- a dense state dict does not say which layer belongs to which stage.
+    But the framework *does* know: it performs that split at training time.  This
+    derives the mapping by running the same ``split_sequential``, so the
+    checkpoint and the training run cannot disagree about where a layer went.
+
+    It also pins the names.  With the old position-renaming container every
+    stage reported ``0.weight``, so a derived mapping would have had one entry
+    per stage all called ``0.weight`` -- useless, and silently so.
+    """
+    import torch
+
+    from aitrainer import stage_assignment
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(4, 4)
+            self.middle = torch.nn.ReLU()
+            self.o_proj = torch.nn.Linear(4, 4)
+
+        def forward(self, value):
+            return self.o_proj(self.middle(self.q_proj(value)))
+
+    mapping = stage_assignment(Block(), 2)
+    assert mapping == {"q_proj.weight": 0, "q_proj.bias": 0,
+                       "o_proj.weight": 1, "o_proj.bias": 1}, mapping
+    assert set(mapping) == {name for name, _ in Block().named_parameters()}, (
+        "every parameter must be assigned, or convert would write it to a default stage")
+
+
+def test_convert_accepts_a_derived_stage_assignment(tmp_path):
+    """End to end: derive the mapping, convert a per-stage sharded checkpoint."""
+    import torch
+
+    from aitrainer import CheckpointConverter, stage_assignment
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(4, 4)
+            self.middle = torch.nn.ReLU()
+            self.o_proj = torch.nn.Linear(4, 4)
+
+        def forward(self, value):
+            return self.o_proj(self.middle(self.q_proj(value)))
+
+    model = Block()
+    torch.save(model.state_dict(), tmp_path / "dense.pt")
+    manifest = CheckpointConverter().convert(
+        tmp_path / "dense.pt", tmp_path / "sharded", pp_size=2,
+        stage_assignment=stage_assignment(model, 2))
+    assert manifest.logical_sharding["pp"] == 2
+    per_stage: dict[int, set] = {}
+    for name, shards in manifest.tensors.items():
+        for shard in shards:
+            per_stage.setdefault(shard.target_rank[0], set()).add(name)
+    assert per_stage[0] == {"q_proj.weight", "q_proj.bias"}, per_stage
+    assert per_stage[1] == {"o_proj.weight", "o_proj.bias"}, per_stage

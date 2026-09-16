@@ -20,7 +20,8 @@ from ..core.torch import module_base
 # them from.  The list is load-bearing: without it ruff reads the imports as
 # unused and deletes them.
 __all__ = ["PipelineSequence", "PipelineShapeError", "StagePlan", "TensorSpec",
-           "normalize_loss", "plan_stages", "split_microbatches", "split_sequential"]
+           "normalize_loss", "plan_stages", "split_microbatches", "split_sequential",
+           "stage_assignment"]
 
 # Must be an expression at import time: the class below inherits from it.
 ModuleBase, nn = module_base()
@@ -163,3 +164,26 @@ def split_sequential(module: Any, pp_size: int, *, policy: str = "uniform_layers
     plans = plan_stages(layers, pp_size, policy=policy, sample=sample)
     stages = tuple(PipelineSequence(named[p.start:p.stop]) for p in plans)
     return stages, plans
+
+
+def stage_assignment(model: Any, pp_size: int, *, policy: str = "uniform_layers",
+                     sample: Any = None) -> dict[str, int]:
+    """``{parameter name: stage index}`` for the split :func:`split_sequential` makes.
+
+    ``CheckpointConverter.convert`` needs this to write per-stage files, and it
+    used to demand the caller supply it by hand -- refusing ``pp_size>1``
+    without one, because the mapping is not derivable from a dense state dict.
+    It is derivable from the *split*: this runs the same ``split_sequential``
+    the training path runs and reports which stage owns each parameter, so the
+    two cannot disagree about where a layer went.
+
+    The names are the model's own because ``PipelineSequence`` keeps them (see
+    there); with the position-renaming ``nn.Sequential`` every stage reported
+    ``0.weight`` and the mapping would have been useless.
+    """
+    stages, plans = split_sequential(model, pp_size, policy=policy, sample=sample)
+    assignment: dict[str, int] = {}
+    for plan, stage in zip(plans, stages):
+        for name, _ in stage.named_parameters():
+            assignment[name] = plan.stage
+    return assignment

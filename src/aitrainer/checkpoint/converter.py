@@ -43,12 +43,16 @@ class CheckpointConverter:
         stage_assignment = dict(stage_assignment or {})
         if pp_size > 1 and not stage_assignment:
             # Which tensors belong to which stage is not derivable from a dense
-            # state dict, so PP conversion needs it explicitly.  Previously
-            # logical_sharding recorded pp_size while every pp_rank received the
-            # SAME chunk: each stage file held the whole model.
+            # state dict on its own -- but it IS derivable from the split the
+            # training path performs, so callers should not have to hand-write
+            # it.  Previously logical_sharding recorded pp_size while every
+            # pp_rank received the SAME chunk: each stage file held the whole
+            # model.
             raise ConversionError(
                 "pp_size>1 requires stage_assignment mapping tensor names to stage "
-                "indices; without it every stage would be written the entire state dict")
+                "indices; without it every stage would be written the entire state "
+                "dict. Derive it from the model with "
+                "parallel.pp_shapes.stage_assignment(model, pp_size)")
 
         def stage_of(name: str) -> int:
             stage = int(stage_assignment.get(name, 0))

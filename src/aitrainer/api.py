@@ -108,6 +108,7 @@ from .parallel.pp_shapes import (
                          plan_stages,
                          split_microbatches,
                          split_sequential,
+                         stage_assignment,
 )
 from .parallel.sp_ulysses import UlyssesAttention, all_to_all_layout, distributed_attention
 from .parallel.tp import (
@@ -272,6 +273,7 @@ __all__ = [
                          "sequence_parallel_styles",
                          "split_microbatches",
                          "split_sequential",
+                         "stage_assignment",
                          "suggest_plan",
                          "supports_gradient_sync",
                          "validate",
