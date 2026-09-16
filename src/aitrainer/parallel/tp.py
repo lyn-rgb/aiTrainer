@@ -158,7 +158,27 @@ def sequence_parallel_styles(module: Any, *, sequence_dim: int = 1) -> dict[str,
     """
     import torch
     style = _sharded_norm_style(sequence_dim)
-    supported = (torch.nn.LayerNorm, torch.nn.Dropout)
+    # LayerNorm only -- NOT nn.Dropout, which an earlier version wrapped here too.
+    #
+    # Dropout inside the region draws its mask from the rank's own RNG stream, and
+    # every rank's stream starts at the same place.  Rank 0 is dropped out with
+    # the masks of the sequence's first block and rank 1 with the SAME masks
+    # applied to the second block, so the result is not what one process computes:
+    # measured `max|diff| = 9.6e-01` against a single-process reference.
+    #
+    # PyTorch has the machinery for this (`OffsetBasedRNGTracker` in
+    # `distributed.tensor._random`), but it only engages for DTensor random ops
+    # and `nn.Dropout` does not go through one, and `is_rng_supported_mesh`
+    # returns False on a CPU mesh -- the module says "only supports a GPU device
+    # mesh".  So there is no way to make it correct here, and a wrong mask must
+    # not be silent.
+    #
+    # Keeping dropout OUT is what makes it right, not a compromise: this style
+    # gathers the norm's output back to the full sequence (see
+    # `_sharded_norm_style`), so a dropout that follows a norm sees the whole
+    # sequence on every rank and reproduces one process exactly.  Sequence
+    # parallelism here shards each norm's own activation, nothing else.
+    supported = (torch.nn.LayerNorm,)
     return {name: style for name, child in module.named_modules()
             if name and isinstance(child, supported)}
 
