@@ -545,6 +545,11 @@ def test_sharded_checkpoint_roundtrip_at_two_ranks():
     optimizer assertions below would pass while proving nothing.  The shard count
     matters too: ``get_model_state_dict`` returns full-shaped tensors and DCP
     splits them for storage, so "one file" would mean no sharding happened.
+
+    The LR schedule is checked here as well as single-process: the schedule's
+    position used to be dropped by this format entirely, and the optimizer's own
+    ``param_groups`` carry the current lr, so the loss of it is invisible until a
+    scheduler that computes an lr from ``last_epoch`` steps again.
     """
     for payload in require_success(run_case("sharded_checkpoint_roundtrip", 2,
                                             hard_timeout=180.0)):
@@ -555,6 +560,15 @@ def test_sharded_checkpoint_roundtrip_at_two_ranks():
         assert payload["global_step"] == 3 and payload["optimizer_step"] == 3
         assert payload["optimizer_state_entries"] > 0, (
             "the optimizer state did not survive; the checkpoint is not resumable")
+        assert payload["restored_epoch"] == payload["saved_epoch"] == 3, (
+            f"the schedule position did not survive: saved at "
+            f"{payload['saved_epoch']}, restored at {payload['restored_epoch']}")
+        # The step after the resume has to land on the same lr the ORIGINAL run
+        # produced on the same step -- that is the value training consumes, and
+        # the one a lost schedule position changes.
+        assert payload["lr_after_step"] == payload["lr_reference"], (
+            f"the schedule is off after a resume: {payload['lr_after_step']} "
+            f"against the original run's {payload['lr_reference']}")
 
 
 # Every axis combination this framework accepts at the world sizes a single

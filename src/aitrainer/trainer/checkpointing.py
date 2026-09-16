@@ -98,6 +98,29 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
                      None if math.isnan(gauss) else gauss))
 
 
+def _object_state(obj: Any) -> dict[str, Any] | None:
+    """``obj.state_dict()``, or None when the trainer has no such object.
+
+    None rather than ``{}`` on purpose: an empty dict writes no keys, so a
+    restore that *does* have the object fails loudly on a missing key instead of
+    quietly restoring nothing.  The distinction is the whole reason this is a
+    function and not an inline call.
+    """
+    if obj is None or not hasattr(obj, "state_dict"):
+        return None
+    return obj.state_dict()
+
+
+# The data provider is only known INSIDE ``fit`` (``loop.fit`` assigns
+# ``trainer._data_provider`` from its ``data`` argument), so at ``load_sharded``
+# time there is usually no live object to derive a placeholder shape from.
+# Its state therefore travels as bytes, a non-tensor DCP entry: DCP replaces
+# non-tensor values wholesale, so any placeholder works and no shape has to be
+# predicted.  (A tensor would have to match the saved shape exactly -- the trap
+# ``_rng_state`` exists to avoid.)  ``fit`` applies it on the next call.
+_SAMPLER_KEY = "sampler"
+
+
 def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
     """Write a sharded checkpoint with ``torch.distributed.checkpoint``.
 
@@ -108,6 +131,17 @@ def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
     function whose behaviour depends on configuration.
 
     DCP is collective, so every rank must call this with the SAME path.
+
+    This carries the same contents as :func:`save_checkpoint` -- model,
+    optimizer, scheduler, scaler, sampler position, step counters and both RNG
+    streams.  It used to write only model/optimizer/bookkeeping, so a run resumed
+    from it diverged from the run that wrote it: no RNG (fixed earlier), and no
+    scheduler, so the LR schedule restarted from step 0.  Measured with
+    ``CosineAnnealingLR``: after four steps the reference run sits at lr
+    0.065451, and resuming two more steps from a sharded checkpoint gave
+    0.059201 against the correct 0.034549.  ``StepLR`` hides this, because it
+    multiplies the current lr (which the optimizer state restores) rather than
+    computing one from ``last_epoch``.
     """
     try:
         from torch.distributed.checkpoint.state_dict import (
@@ -116,6 +150,8 @@ def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
         )
     except ImportError as exc:
         raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
+    import pickle
+
     import torch
 
     module = _stateful_module(trainer.model)
@@ -126,13 +162,20 @@ def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
     # one rank's version as THE value and hand it to everybody.  The coordinate
     # namespaces it, the same way PP stages need their own namespace.
     coordinate = _coordinate(trainer)
-    state = {
+    state: dict[str, Any] = {
         "model": get_model_state_dict(module),
         "optimizer": get_optimizer_state_dict(module, trainer.optimizer),
         "bookkeeping": torch.tensor([trainer.global_step, trainer.optimizer_step],
                                     dtype=torch.int64),
         f"rng.{coordinate[0]}.{coordinate[1]}.{coordinate[2]}": _rng_state(),
     }
+    for key, obj in (("scheduler", trainer.scheduler), ("scaler", trainer.scaler)):
+        payload = _object_state(obj)
+        if payload is not None:
+            state[key] = payload
+    provider = getattr(trainer, "_data_provider", None)
+    if provider is not None and hasattr(provider, "state_dict"):
+        state[_SAMPLER_KEY] = pickle.dumps(provider.state_dict(), protocol=pickle.HIGHEST_PROTOCOL)
     CheckpointManager(runtime=trainer.runtime).save_dcp(
         path, state=state,
         metadata={"world_size": trainer.runtime.world_size, "format": "dcp-sharded",
@@ -145,6 +188,12 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
     The state dict passed in is a *recipe*: DCP fills it in place, reading each
     rank's own shards.  Bookkeeping travels as a tensor so it survives the same
     path as everything else.
+
+    Scheduler and scaler states carry their own object's layout as the
+    placeholder, so a checkpoint written by a different kind of scheduler is
+    refused by DCP rather than applied on top of the wrong one.  The sampler
+    position is left on the trainer for the next :meth:`Trainer.fit` to apply --
+    see ``_SAMPLER_KEY``.
     """
     try:
         from torch.distributed.checkpoint.state_dict import (
@@ -162,7 +211,7 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
     trainer.offload.drain(trainer.optimizer)
     coordinate = _coordinate(trainer)
     rng_key = f"rng.{coordinate[0]}.{coordinate[1]}.{coordinate[2]}"
-    state = {
+    state: dict[str, Any] = {
         "model": get_model_state_dict(module),
         "optimizer": get_optimizer_state_dict(module, trainer.optimizer),
         "bookkeeping": torch.zeros(2, dtype=torch.int64),
@@ -175,14 +224,32 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
         # what it is for; see its docstring.
         rng_key: _rng_state(),
     }
-    metadata = CheckpointManager(runtime=trainer.runtime).load_dcp(path, state=state)
+    for key, obj in (("scheduler", trainer.scheduler), ("scaler", trainer.scaler)):
+        payload = _object_state(obj)
+        if payload is not None:
+            state[key] = payload
+    # Only claimed when the checkpoint actually holds it: DCP refuses a recipe
+    # key that is not in the checkpoint, and a provider is optional, so adding
+    # this unconditionally would break every run saved without one.
+    manager = CheckpointManager(runtime=trainer.runtime)
+    if _SAMPLER_KEY in manager.dcp_keys(path):
+        state[_SAMPLER_KEY] = b""
+    metadata = manager.load_dcp(path, state=state)
     _restore_rng(state[rng_key])
     set_model_state_dict(module, state["model"])
     set_optimizer_state_dict(module, trainer.optimizer, state["optimizer"])
+    if trainer.scheduler is not None and state.get("scheduler") is not None:
+        trainer.scheduler.load_state_dict(dict(state["scheduler"]))
+    if trainer.scaler is not None and state.get("scaler") is not None:
+        trainer.scaler.load_state_dict(dict(state["scaler"]))
+    # Stashed rather than applied: the provider is not known until fit() is
+    # called with the data, and a caller resuming a run calls load_sharded()
+    # first.  fit() consumes this and clears it.
+    trainer._restored_sampler_state = state.get(_SAMPLER_KEY)
     trainer.global_step = int(state["bookkeeping"][0].item())
     trainer.optimizer_step = int(state["bookkeeping"][1].item())
     return {"global_step": trainer.global_step, "optimizer_step": trainer.optimizer_step,
-            "metadata": metadata}
+            "sampler_state": state.get(_SAMPLER_KEY), "metadata": metadata}
 
 
 def load_pretrained(trainer: Any, path: str | os.PathLike[str], *,

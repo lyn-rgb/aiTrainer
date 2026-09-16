@@ -213,3 +213,213 @@ def test_sharded_checkpoint_restores_the_random_stream(tmp_path):
         "does not draw what the run that wrote it drew")
     assert got[1] == expected[1], "the Python stream was not restored"
     trainer.close()
+
+
+def _scheduled_trainer(scheduler_factory, *, provider=None):
+    """A trainer whose LR schedule actually moves, for the resume tests below."""
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(8, 8)
+
+        def forward(self, value):
+            return self.linear(value)
+
+    torch.manual_seed(3)
+    runtime = Runtime(device="cpu", init_process_group=False, seed=3)
+    model = Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = Trainer(model, optimizer, config=FrameworkConfig(device="cpu", seed=3),
+                      runtime=runtime, scheduler=scheduler_factory(optimizer),
+                      loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+    if provider is not None:
+        trainer._data_provider = provider
+    return trainer
+
+
+def _batches(count):
+    import torch
+    return [(torch.randn(2, 8), torch.randn(2, 8)) for _ in range(count)]
+
+
+def test_sharded_checkpoint_restores_the_scheduler(tmp_path):
+    """A resume must land on the same LR, not restart the schedule.
+
+    ``save_sharded`` wrote model/optimizer/bookkeeping, so
+    ``scheduler.state_dict()`` was simply absent: the optimizer's own
+    ``param_groups`` carried the current lr back -- which is why this went
+    unnoticed -- but ``last_epoch`` came back 0 and the schedule restarted from
+    there.  Measured with ``CosineAnnealingLR``, which computes an lr from
+    ``last_epoch``: after four steps the run sits at 0.065451, and two more
+    steps gave 0.059201 from a sharded resume against the correct 0.034549.
+
+    ``StepLR`` is the reason it hid: it *multiplies* whatever lr it finds, so
+    restoring the optimizer alone happens to reproduce the schedule exactly.
+    """
+    import torch
+
+    for name, factory in (
+            ("cosine", lambda opt: torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)),
+            ("step", lambda opt: torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.5))):
+        path = tmp_path / name
+
+        reference = _scheduled_trainer(factory)
+        for batch in _batches(4):
+            reference.train_step(batch)
+        reference.save_checkpoint(tmp_path / f"{name}-per-rank")
+
+        saver = _scheduled_trainer(factory)
+        for batch in _batches(4):
+            saver.train_step(batch)
+        saver.save_sharded(path)
+
+        # Per-rank format: the reference the sharded one has to match.
+        from_per_rank = _scheduled_trainer(factory)
+        from_per_rank.load_checkpoint(tmp_path / f"{name}-per-rank")
+        from_sharded = _scheduled_trainer(factory)
+        from_sharded.load_sharded(path)
+
+        assert (from_sharded.scheduler.last_epoch
+                == from_per_rank.scheduler.last_epoch
+                == reference.scheduler.last_epoch), (
+            f"{name}: the schedule position did not survive a sharded resume "
+            f"(sharded {from_sharded.scheduler.last_epoch}, "
+            f"per-rank {from_per_rank.scheduler.last_epoch})")
+        # And the lr those positions produce, which is what training actually
+        # consumes: two more steps must follow the same curve.
+        for trainer in (from_per_rank, from_sharded):
+            for batch in _batches(2):
+                trainer.train_step(batch)
+        assert (from_sharded.optimizer.param_groups[0]["lr"]
+                == from_per_rank.optimizer.param_groups[0]["lr"]), (
+            f"{name}: the lr schedule diverged after a sharded resume "
+            f"({from_sharded.optimizer.param_groups[0]['lr']} vs "
+            f"{from_per_rank.optimizer.param_groups[0]['lr']})")
+        for trainer in (reference, saver, from_per_rank, from_sharded):
+            trainer.close()
+
+
+def test_sharded_checkpoint_restores_the_data_position(tmp_path):
+    """The provider's read position travels too, and is applied by the next fit.
+
+    ``load_sharded`` cannot apply it: the provider is ``fit``'s ``data``
+    argument, which is passed after the checkpoint is loaded.  It is stashed and
+    taken by exactly one ``fit`` -- leaving it set would rewind the provider on
+    every later call.
+    """
+    import torch
+
+    class Provider:
+        """Only the two methods the loop contract uses."""
+
+        def __init__(self, cursor: int = 0) -> None:
+            self.cursor = cursor
+            self.applied = []
+
+        def state_dict(self):
+            return {"cursor": self.cursor}
+
+        def load_state_dict(self, state):
+            self.applied.append(dict(state))
+            self.cursor = state["cursor"]
+
+        def train_dataloader(self, *, dp_group=None, seed=None):
+            return [(torch.randn(2, 8), torch.randn(2, 8))]
+
+    saver = _scheduled_trainer(lambda opt: torch.optim.lr_scheduler.StepLR(opt, 1),
+                               provider=Provider(cursor=17))
+    path = tmp_path / "sharded"
+    saver.save_sharded(path)
+
+    resumed = _scheduled_trainer(lambda opt: torch.optim.lr_scheduler.StepLR(opt, 1))
+    provider = Provider(cursor=0)
+    resumed.load_sharded(path)
+    assert provider.applied == [], "the provider was loaded before fit had it"
+
+    resumed.fit(provider, epochs=1)
+    assert provider.applied == [{"cursor": 17}], (
+        f"the saved position did not reach the provider: {provider.applied}")
+
+    # A second fit must not rewind it.
+    resumed.fit(provider, epochs=1)
+    assert provider.applied == [{"cursor": 17}], (
+        "the stashed position was applied more than once, so every later fit "
+        f"rewinds the data: {provider.applied}")
+    for trainer in (saver, resumed):
+        trainer.close()
+
+
+def test_sharded_load_refuses_a_namespace_it_cannot_restore(tmp_path):
+    """A checkpoint holding more than the recipe claims must be refused, not half-read.
+
+    DCP fills the state dict it is handed and ignores the rest, so a scheduler
+    saved but not claimed restores everything else and drops it silently --
+    which is what the sharded format did to the RNG and the schedule.  The
+    reverse direction is already loud (DCP raises "Missing key").
+
+    The check is per namespace rather than per key on purpose: a sharded
+    checkpoint is partitioned across ranks while the metadata is global, so the
+    unclaimed *keys* on one rank are mostly another rank's (a pipeline stage's
+    other stages, the RNG under another coordinate).  Comparing keys refused
+    every working checkpoint -- measured, 48 spurious entries at dp2-pp2.
+    """
+    import pytest
+    import torch
+
+    from aitrainer.checkpoint.manager import CheckpointError
+
+    saver = _scheduled_trainer(lambda opt: torch.optim.lr_scheduler.StepLR(opt, 1))
+    path = tmp_path / "sharded"
+    saver.save_sharded(path)
+
+    # The same checkpoint, restored by a trainer with no scheduler: the
+    # ``scheduler`` namespace is in the file and nothing would read it.
+    unscheduled = _scheduled_trainer(lambda opt: torch.optim.lr_scheduler.StepLR(opt, 1))
+    unscheduled.scheduler = None
+    with pytest.raises(CheckpointError) as caught:
+        unscheduled.load_sharded(path)
+    assert "scheduler" in str(caught.value), (
+        f"the refusal does not name the namespace it would drop: {caught.value}")
+
+    for trainer in (saver, unscheduled):
+        trainer.close()
+
+
+def test_flatten_keys_matches_torch(tmp_path):
+    """``_flatten_keys`` must mirror DCP's own key space, not approximate it.
+
+    The manager reimplements the traversal in ``torch/.../_traverse.py`` rather
+    than importing that private module, and the two are pinned together here
+    against the installed torch.  A version that changed the rule fails this
+    test instead of quietly weakening the namespace check above.
+
+    The interesting case is a list: DCP descends into one only when it holds
+    something traversable, so ``base_lrs=[0.1, 0.1]`` is ONE key while
+    ``[{"a": 1}]`` is ``....0.a``.
+    """
+    import torch
+    from torch.distributed.checkpoint import FileSystemReader, save
+
+    from aitrainer.checkpoint.manager import CheckpointManager
+
+    cases = {
+        "plain": {"w": torch.zeros(2)},
+        "nested": {"block": {"w": torch.zeros(2), "b": torch.zeros(2)}},
+        "list of numbers": {"nested": {"base_lrs": [0.1, 0.1], "_last_lr": [0.03]}},
+        "list of mappings": {"nested": {"groups": [{"lr": 0.1}, {"lr": 0.2}]}},
+        "list of tensors": {"nested": {"bufs": [torch.zeros(2), torch.zeros(3)]}},
+        "mixed": {"a": {"b": [{"c": torch.zeros(1)}]}, "d": 3},
+    }
+    root = tmp_path / "probe"
+    for index, (label, value) in enumerate(cases.items()):
+        target = root / str(index)
+        save(dict(value), checkpoint_id=str(target))
+        theirs = set(FileSystemReader(str(target)).read_metadata().state_dict_metadata)
+        ours = CheckpointManager._flatten_keys(value)
+        assert ours == theirs, (
+            f"{label}: _flatten_keys disagrees with torch's traversal "
+            f"(ours {sorted(ours)}, torch {sorted(theirs)})")

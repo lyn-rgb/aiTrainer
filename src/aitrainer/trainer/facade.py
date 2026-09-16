@@ -102,6 +102,11 @@ class Trainer:
         self.optimizer_step = 0
         self.history: list[StepOutput] = []
         self._data_provider: Any = None
+        # A sharded checkpoint's provider position, waiting for the fit() that
+        # will supply the provider.  ``load_sharded`` cannot apply it itself: the
+        # provider arrives as fit()'s ``data`` argument, which is normally passed
+        # AFTER the checkpoint is loaded.
+        self._restored_sampler_state: Any = None
         self._dp_group: Any = _UNRESOLVED_DP_GROUP
         self.offload = OffloadManager(self.config.offload, overlap_config=self.config.overlap)
         # No `enabled=` flag: the five switches this used to fold together only

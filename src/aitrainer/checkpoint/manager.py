@@ -33,6 +33,33 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _entry_is_terminal(entry: Any) -> bool:
+    """DCP's ``_is_terminal`` for one element: a mapping is never terminal."""
+    if isinstance(entry, Mapping):
+        return False
+    if isinstance(entry, list):
+        return _list_is_terminal(entry)
+    return True
+
+
+def _list_is_terminal(value: list) -> bool:
+    """Does DCP treat this list as one value rather than as a container to descend?
+
+    It descends only when the list holds something traversable: a nested mapping,
+    a list that is itself not terminal, or a tensor.  A list of numbers -- which
+    is what ``LRScheduler.state_dict()`` stores in ``base_lrs`` and ``_last_lr``
+    -- is therefore a single entry, not one per element.  Mirrors ``_is_terminal``
+    in ``torch/distributed/checkpoint/_traverse.py``.
+    """
+    import torch
+    for entry in value:
+        if not _entry_is_terminal(entry):
+            return False
+        if isinstance(entry, torch.Tensor):
+            return False
+    return True
+
+
 class CheckpointError(RuntimeError):
     """Base checkpoint failure with a recoverable path/context."""
 
@@ -273,13 +300,102 @@ class CheckpointManager:
                 shutil.rmtree(staging, ignore_errors=True)
             raise
 
+    @staticmethod
+    def _flatten_keys(value: Any, prefix: str = "") -> set[str]:
+        """The keys DCP will use for ``value``, mirroring its own traversal.
+
+        DCP flattens nested mappings into dot-joined leaf keys, and descends into
+        a list only when the list holds something traversable.  ``[0.1, 0.1]``
+        is therefore ONE key, not two -- getting this wrong would make the
+        coverage check below compare two different key spaces.
+
+        This mirrors ``torch/distributed/checkpoint/_traverse.py`` rather than
+        importing it (a private module).  ``test_flatten_keys_matches_torch``
+        pins the two together against the installed torch, so a version that
+        changed the rule fails there instead of quietly weakening the check.
+        """
+        from collections.abc import Mapping
+
+        if isinstance(value, Mapping):
+            keys: set[str] = set()
+            for name, inner in value.items():
+                keys |= CheckpointManager._flatten_keys(inner, f"{prefix}{name}.")
+            return keys
+        if isinstance(value, list) and not _list_is_terminal(value):
+            keys = set()
+            for index, item in enumerate(value):
+                keys |= CheckpointManager._flatten_keys(item, f"{prefix}{index}.")
+            return keys
+        return {prefix.rstrip(".")}
+
+    @staticmethod
+    def _namespaces(keys: Any) -> set[str]:
+        """The first dotted segment of each key: ``model.unit2.w`` -> ``model``."""
+        return {key.split(".", 1)[0] for key in keys}
+
+    def _reject_unclaimed_namespaces(self, reader: Any, state: Mapping[str, Any]) -> None:
+        """Refuse a checkpoint holding a namespace the restore recipe never mentions.
+
+        DCP fills the state dict it is handed, key by key.  An entry in the
+        checkpoint with no counterpart there is not an error to DCP -- it is
+        simply not read.  So a scheduler saved under ``scheduler.*`` and loaded
+        against a recipe without that namespace restores everything else and
+        silently drops it, which is indistinguishable from a complete restore
+        until the run diverges.  (The other direction is already loud: a recipe
+        key the checkpoint does not have raises "Missing key in checkpoint
+        state_dict".)
+
+        The comparison is per NAMESPACE, not per key, and that is deliberate.
+        A sharded checkpoint is partitioned across ranks while
+        ``read_metadata`` reports the GLOBAL key set, so the unclaimed keys on
+        any one rank are mostly another rank's: a pipeline stage holds
+        ``model.unit0.*`` while the metadata also lists stage 1's
+        ``model.unit2.*``, and the RNG state is namespaced by coordinate.  Key
+        sets therefore differ legitimately on every load and comparing them
+        would refuse every working checkpoint -- measured, before this was
+        narrowed: 48 spurious entries under ``dp2-pp2``.
+
+        What the namespace view does catch is the failure that actually
+        happened: a whole family (scheduler, scaler, sampler) present in the
+        checkpoint and absent from the recipe.
+        """
+        saved = set(reader.read_metadata().state_dict_metadata)
+        claimed = self._flatten_keys(state)
+        orphan = sorted(self._namespaces(saved - claimed) - self._namespaces(claimed))
+        if orphan:
+            raise CheckpointError(
+                f"this checkpoint holds {len(orphan)} entries that the state being restored "
+                f"never mentions, so loading would drop them without saying so: "
+                f"{', '.join(orphan)}. Restore with the same objects that wrote it "
+                "(scheduler, scaler, data provider), or load the entries deliberately.")
+
+    def dcp_keys(self, path: str | Path) -> set[str]:
+        """The entry names a published DCP checkpoint holds.
+
+        Needed before a load to decide whether an OPTIONAL namespace is present:
+        DCP refuses a recipe key the checkpoint lacks ("Missing key in checkpoint
+        state_dict"), so a placeholder cannot simply be added on the chance that
+        it was saved.
+        """
+        source = Path(path)
+        if not (source / "READY").is_file():
+            raise IncompleteCheckpointError(f"DCP checkpoint is incomplete: {source}")
+        try:
+            import torch.distributed.checkpoint as dcp
+        except ImportError as exc:
+            raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
+        reader = dcp.FileSystemReader(str(source / "dcp"))
+        return set(reader.read_metadata().state_dict_metadata)
+
     def load_dcp(self, path: str | Path, *, state: dict[str, Any]) -> dict[str, Any]:
         source = Path(path)
         if not (source / "READY").is_file():
             raise IncompleteCheckpointError(f"DCP checkpoint is incomplete: {source}")
         try:
             import torch.distributed.checkpoint as dcp
-            dcp.load(state, storage_reader=dcp.FileSystemReader(str(source / "dcp")))
+            reader = dcp.FileSystemReader(str(source / "dcp"))
+            self._reject_unclaimed_namespaces(reader, state)
+            dcp.load(state, storage_reader=reader)
         except ImportError as exc:
             raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
         metadata_path = source / "metadata.json"

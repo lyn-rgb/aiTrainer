@@ -1219,6 +1219,11 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
     rather than SGD so the optimizer genuinely has state to carry -- with plain
     SGD ``get_optimizer_state_dict`` returns an empty state and the test would
     pass while proving nothing about optimizer persistence.
+
+    A CosineAnnealingLR rides along for the same reason: the schedule is state
+    the checkpoint has to carry, and its position is the part a resume gets
+    wrong.  It is checked here rather than only single-process because this is
+    the path where the checkpoint is genuinely partitioned across ranks.
     """
     import os
     import shutil
@@ -1242,7 +1247,9 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
         runtime = Runtime(device="cpu", seed=7)
         wrapped = parallelize(module, config=config, runtime=runtime)
         optimizer = torch.optim.AdamW(wrapped.parameters(), lr=0.01)
-        trainer = Trainer(wrapped, optimizer, config=config, runtime=runtime)
+        trainer = Trainer(wrapped, optimizer, config=config, runtime=runtime,
+                          scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(
+                              optimizer, T_max=10))
         return trainer
 
     trainer = build()
@@ -1262,19 +1269,39 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
     written = sorted(item.name for item in path.iterdir())
     shards = sorted(name for name in os.listdir(path / "dcp") if name.endswith(".distcp"))
 
+    saved_lr = trainer.optimizer.param_groups[0]["lr"]
+    saved_epoch = trainer.scheduler.last_epoch
     trainer2 = build()
     restored = trainer2.load_sharded(path)
     after = _flatten(trainer2.model.module)
+    # Read the position BEFORE any step: train_step advances the scheduler
+    # itself (trainer/step.py), so reading afterwards reports one past the
+    # restored value and a correct restore looks off by one.
+    restored_epoch = trainer2.scheduler.last_epoch
     dist.barrier()
     if rank == 0:
         shutil.rmtree(path, ignore_errors=True)
     # Measure the optimizer state itself, not the metadata blob it travels with.
     # Zero entries would mean the checkpoint is not resumable.
     optimizer_state_entries = sum(len(entry) for entry in trainer2.optimizer.state.values())
+    # One more step on each: a restored schedule position has to produce the same
+    # lr the run being resumed would have, not merely look right on arrival --
+    # the optimizer's own param_groups carry the current lr either way.  The
+    # reference is the ORIGINAL trainer taking that same step, so the comparison
+    # does not restate the schedule's formula in the test.
+    generator = torch.Generator().manual_seed(9999)
+    step_batch = (torch.randn(4, 8, generator=generator),
+                  torch.randint(0, 4, (4,), generator=generator))
+    trainer2.train_step(step_batch)
+    trainer.train_step(step_batch)
+    lr_reference = trainer.optimizer.param_groups[0]["lr"]
     return {"rank": rank, "written": written, "shards": shards,
             "global_step": restored["global_step"], "optimizer_step": restored["optimizer_step"],
             "format": (restored["metadata"] or {}).get("format"),
             "optimizer_state_entries": optimizer_state_entries,
+            "saved_epoch": saved_epoch, "restored_epoch": restored_epoch,
+            "saved_lr": saved_lr, "lr_after_step": trainer2.optimizer.param_groups[0]["lr"],
+            "lr_reference": lr_reference,
             "max_diff": max(abs(a - b) for a, b in zip(before, after))
                         if len(before) == len(after) else float("inf")}
 

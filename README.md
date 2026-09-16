@@ -104,10 +104,17 @@ FSDP and pipeline paths against real multi-process jobs.
 
 ## Checkpoints
 
-Atomic directories with a `READY` marker and per-file checksums, storing RNG,
-optimizer, scheduler, scaler and sampler state with explicit world-size
+Two formats, both of them complete resumes. `save_checkpoint` writes one atomic
+directory per rank (a `READY` marker and per-file checksums); `save_sharded` is
+the opt-in `torch.distributed.checkpoint` path with one collective call and one
+shared path. Both carry the model, optimizer, scheduler, scaler, sampler
+position, step counters and both RNG streams, and both have explicit world-size
 compatibility checks. `CheckpointConverter` handles dense-to-sharded conversion
 and `ModelLoader` the manifest-based loading contract.
+
+A sharded load also refuses a checkpoint that holds a namespace the restoring
+state never mentions (a scheduler, say), rather than reading everything else and
+dropping it without saying so.
 
 ## Offload and overlap
 

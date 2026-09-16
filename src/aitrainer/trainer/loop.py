@@ -17,6 +17,15 @@ def fit(trainer, data, *, epochs: int = 1, max_steps: int | None = None,
         state = trainer.load_checkpoint(resume_from)
         if trainer._data_provider is not None and state.get("sampler_state"):
             trainer._data_provider.load_state_dict(state["sampler_state"])
+    # A sharded checkpoint's position, waiting for exactly this call: the
+    # provider arrives as `data`, so ``load_sharded`` could not apply it.  Taken
+    # once -- leaving it set would rewind the provider on every later fit().
+    restored = getattr(trainer, "_restored_sampler_state", None)
+    if restored is not None:
+        trainer._restored_sampler_state = None
+        if trainer._data_provider is not None and hasattr(trainer._data_provider, "load_state_dict"):
+            import pickle
+            trainer._data_provider.load_state_dict(pickle.loads(bytes(restored)))
     for epoch in range(epochs):
         if hasattr(data, "set_epoch"):
             data.set_epoch(epoch)
