@@ -146,3 +146,70 @@ def test_manifest_round_trip_keeps_every_field(tmp_path):
             f"Manifest.{field.name} did not survive the round trip -- "
             "it is in the dataclass but not in from_dict")
     assert restored.tensors["w"][0] == shard
+
+
+def test_sharded_checkpoint_restores_the_random_stream(tmp_path):
+    """Resuming from a sharded checkpoint must reproduce the run it resumed.
+
+    ``save_sharded`` wrote ``model``/``optimizer``/``bookkeeping`` and nothing
+    else, so a resumed run drew different randomness than the run that wrote it
+    -- two runs of the same experiment diverged from the resume point, with no
+    sign that anything was missing.  The per-rank format had always stored the
+    torch and Python RNG state and restored it by default; this is the sharded
+    path catching up.
+    """
+    import random
+
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(8, 8)
+
+        def forward(self, value):
+            return self.linear(value)
+
+    def build() -> Trainer:
+        torch.manual_seed(3)
+        runtime = Runtime(device="cpu", init_process_group=False, seed=3)
+        model = Model()
+        return Trainer(model, torch.optim.SGD(model.parameters(), lr=0.01),
+                       config=FrameworkConfig(device="cpu", seed=3), runtime=runtime,
+                       loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+
+    # Two identical runs.  The first is the reference: it draws what the stream
+    # gives after the fit, which is what a resume has to reproduce.  The second
+    # saves at the same point and is then moved somewhere else before loading.
+    #
+    # Drawing `expected` from the SAME run and then saving is the trap -- the
+    # saved stream is by then already past those draws, so the comparison fails
+    # against a fully working restore.  That version of this test was written
+    # first and reported the checkpoint as broken.
+    def run() -> Trainer:
+        trainer = build()
+        torch.manual_seed(555)
+        random.seed(555)
+        trainer.fit([(torch.randn(2, 8), torch.randn(2, 8))], epochs=1)
+        return trainer
+
+    run()
+    expected = [torch.randn(3).tolist(), random.random()]
+
+    trainer = run()
+    path = tmp_path / "sharded"
+    trainer.save_sharded(path)
+
+    # Move both streams somewhere else, then load and see whether they come back.
+    torch.manual_seed(991)
+    random.seed(991)
+    trainer.load_sharded(path)
+
+    got = [torch.randn(3).tolist(), random.random()]
+    assert got[0] == expected[0], (
+        "the torch stream was not restored; a run resumed from a sharded checkpoint "
+        "does not draw what the run that wrote it drew")
+    assert got[1] == expected[1], "the Python stream was not restored"
+    trainer.close()

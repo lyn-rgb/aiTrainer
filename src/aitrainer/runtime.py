@@ -67,6 +67,13 @@ class Runtime:
                                   initialized_process_group=owns_group)
         self._closed = False
         self._owns_process_group = owns_group
+        # Set by ``parallelize`` to the DeviceMeshManager it built.  Creating one
+        # is COLLECTIVE (ProcessGroups.create issues the new_group calls every
+        # rank must make in the same order), so a second consumer building its
+        # own would either duplicate that work or, if it ran on a different
+        # schedule, deadlock.  Later stages -- data loading above all, which needs
+        # the DP group to shard by rank -- read it from here.
+        self.mesh: Any = None
         # NOT `seed + rank`.  The rank offset looked like the usual trick for
         # giving each rank different data, and it is the wrong tool for that
         # here: this seeds the *global* RNG, which is where a caller draws model

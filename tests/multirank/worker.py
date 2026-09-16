@@ -1143,6 +1143,73 @@ def _tp_group(world: int, rank: int):
     return ProcessGroups.create(mapping).tp_group
 
 
+@case("data_parallel_group_is_handed_over")
+def data_parallel_group_is_handed_over(rank: int, world: int, dist, options: dict) -> dict:
+    """``Trainer.dp_process_group()`` must hand the data provider a usable group.
+
+    ``loop.fit`` called ``data.train_dataloader(dp_group=None, ...)``.  A provider
+    reading that argument sees no DP axis, so it cannot tell the ranks apart and
+    every rank walks the whole dataset in the same order: data parallelism
+    degenerates into N replicas averaging identical gradients.  It still trains
+    and the loss still falls, so nothing reports that N times the compute buys
+    one rank's batch.
+
+    A non-None group is not enough on its own.  What a provider shards with is
+    ``dist.get_rank(group)`` -- that index has to differ per rank, or every rank
+    still reads shard 0 of a group that happens to exist.  Both are reported.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    # Data parallelism is only valid with a gradient-reducing model, so the two
+    # are configured together -- this is the shape a real run has.
+    config = FrameworkConfig.from_dict({"parallel": {"dp_size": world}, "fsdp": {"enabled": True}})
+    torch.manual_seed(11)
+    module = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 4))
+    runtime = Runtime(device="cpu", seed=11)
+    wrapped = parallelize(module, config=config, runtime=runtime)
+    trainer = Trainer(wrapped, torch.optim.SGD(wrapped.parameters(), lr=0.01),
+                      config=config, runtime=runtime)
+    group = trainer.dp_process_group()
+    if group is None:
+        raise AssertionError(
+            "dp_size>1 but the data provider was handed dp_group=None, so no rank "
+            "can shard the dataset")
+    index = dist.get_rank(group)
+
+    # The group existing is only half of it: ``loop.fit`` and
+    # ``evaluation.evaluate`` are the call sites that were passing ``None``, so
+    # ask them what the provider actually receives.  A recording provider is the
+    # only way to see that, and it is the difference between "the helper works"
+    # and "the helper is used".
+    handed: dict = {}
+
+    class RecordingProvider:
+        def train_dataloader(self, *, dp_group=None, seed=None):
+            handed["dp_group"] = dp_group
+            handed["seed"] = seed
+            return [(torch.randn(4, 8, generator=torch.Generator().manual_seed(1)),
+                     torch.randint(0, 4, (4,), generator=torch.Generator().manual_seed(1)))]
+
+    trainer.fit(RecordingProvider(), epochs=1)
+    fit_group = handed.get("dp_group")
+    handed.clear()
+    trainer.evaluate(RecordingProvider())
+    eval_group = handed.get("dp_group")
+
+    gathered: list = [None] * world
+    dist.all_gather_object(gathered, {"rank": rank, "index": index,
+                                      "fit": fit_group is group,
+                                      "evaluate": eval_group is group})
+    return {"rank": rank, "group": str(group),
+            "group_size": dist.get_world_size(group), "index": index, "seed": 11,
+            "fit_handed_it": fit_group is group,
+            "evaluate_handed_it": eval_group is group,
+            "indices": {str(item["rank"]): item["index"] for item in gathered}}
+
+
 @case("sharded_checkpoint_roundtrip")
 def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> dict:
     """``Trainer.save_sharded`` / ``load_sharded`` at world_size > 1.

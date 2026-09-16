@@ -33,11 +33,18 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
         except ImportError as exc:
             raise RuntimeError("PyTorch distributed is required for multi-rank parallelize") from exc
     device_type = str(getattr(getattr(runtime, "state", None), "device", "cpu")).split(":", 1)[0]
+    provided = mesh is not None
     mesh = mesh or DeviceMeshManager(
         pp_size=config.parallel.pp_size, dp_size=config.parallel.dp_size,
         tp_size=config.parallel.tp_size, world_size=runtime.world_size,
         device_type=device_type,
     )
+    if not provided and getattr(runtime, "mesh", None) is None:
+        # Hand the mesh on for anything that needs a process group later (data
+        # loading needs the DP group).  Building a second one is collective, so
+        # this is the difference between reusing the groups the model already
+        # uses and creating a parallel set.
+        runtime.mesh = mesh
     coordinate = mesh.coordinate
     if config.parallel.pp_size > 1:
         policy = config.planning.stage_policy if config.planning.enabled else "uniform_layers"

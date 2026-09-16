@@ -24,6 +24,10 @@ from .state import StepOutput
 
 logger = logging.getLogger("aitrainer")
 
+# Sentinel: None is a legitimate answer ("no DP axis"), so it cannot also mean
+# "not computed yet".
+_UNRESOLVED_DP_GROUP: Any = object()
+
 
 class Trainer:
     """Train a regular PyTorch module with AMP, accumulation and checkpoints."""
@@ -98,6 +102,7 @@ class Trainer:
         self.optimizer_step = 0
         self.history: list[StepOutput] = []
         self._data_provider: Any = None
+        self._dp_group: Any = _UNRESOLVED_DP_GROUP
         self.offload = OffloadManager(self.config.offload, overlap_config=self.config.overlap)
         # No `enabled=` flag: the five switches this used to fold together only
         # fed a stored-and-never-read attribute, so the controller behaved
@@ -136,6 +141,41 @@ class Trainer:
     def _compute_loss(self, output: Any, batch: Any) -> Any:
         # One implementation, shared with the pipeline paths (see core.batching).
         return compute_loss(output, batch, self.loss_fn)
+
+    def dp_process_group(self) -> Any:
+        """The data-parallel process group, or None when there is no DP axis.
+
+        ``data.train_dataloader`` takes one so a provider can shard the dataset
+        by rank.  It used to be passed ``None`` unconditionally, which left every
+        data-parallel rank walking the whole dataset in the same order -- data
+        parallelism silently became N replicas averaging identical gradients.
+
+        The group comes from the mesh ``parallelize`` built (``runtime.mesh``)
+        rather than a fresh one: constructing a ``DeviceMeshManager`` issues
+        ``new_group`` calls, which every rank must make in the same order, so a
+        second copy is at best wasted work and at worst a different schedule.
+        """
+        if self._dp_group is not _UNRESOLVED_DP_GROUP:
+            return self._dp_group
+        self._dp_group = None
+        if self.runtime.world_size > 1 and self.config.parallel.dp_size > 1:
+            mesh = getattr(self.runtime, "mesh", None)
+            if mesh is None:
+                # A Trainer built by hand, without going through parallelize().
+                try:
+                    from ..mesh import DeviceMeshManager
+                    mesh = DeviceMeshManager(
+                        pp_size=self.config.parallel.pp_size,
+                        dp_size=self.config.parallel.dp_size,
+                        tp_size=self.config.parallel.tp_size,
+                        world_size=self.runtime.world_size,
+                        device_type=str(self.runtime.state.device).split(":", 1)[0])
+                    self.runtime.mesh = mesh
+                except Exception:      # pragma: no cover - reported by the provider path
+                    mesh = None
+            if mesh is not None:
+                self._dp_group = mesh.data_parallel_group
+        return self._dp_group
 
     # --- delegators -------------------------------------------------------
     # The bodies live in sibling modules as functions over this object.  This

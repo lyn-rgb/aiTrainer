@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from ..checkpoint.manager import CheckpointError, CheckpointManager
@@ -49,6 +50,54 @@ def _stateful_module(model: Any) -> Any:
     return inner
 
 
+def _coordinate(trainer: Any) -> tuple[int, int, int]:
+    """This rank's ``(pp, tp, dp)``, from the mesh ``parallelize`` built."""
+    mesh = getattr(getattr(trainer, "runtime", None), "mesh", None)
+    if mesh is None:
+        return (0, 0, 0)
+    coordinate = mesh.coordinate
+    return (int(coordinate.pp), int(coordinate.tp), int(coordinate.dp))
+
+
+def _rng_state() -> dict[str, Any]:
+    """The process RNG state, as fixed-shape tensors.
+
+    DCP decides how many bytes to read from the SHAPE of the state dict it is
+    handed, so the shape has to be the same on the way out and the way back in.
+    Pickling Python's state does not give that: ``random.getstate()`` carries a
+    cached gaussian that is ``None`` until a gaussian draw happens, and the
+    pickle grows when it becomes a float -- measured 3752 bytes on save against
+    3829 on load, which DCP reports as "Size mismatch between saved
+    torch.Size([3752]) and current torch.Size([3829])".
+
+    So the state is decomposed instead of pickled: a version, the Mersenne
+    Twister words, and the cached gaussian with NaN standing in for "none".
+    """
+    import random
+
+    import torch
+    version, internal, gauss = random.getstate()
+    return {
+        "torch": torch.get_rng_state(),
+        "python_version": torch.tensor([int(version)], dtype=torch.int64),
+        "python_internal": torch.tensor([int(word) for word in internal], dtype=torch.int64),
+        "python_gauss": torch.tensor([float("nan") if gauss is None else float(gauss)],
+                                     dtype=torch.float64),
+    }
+
+
+def _restore_rng(state: Mapping[str, Any]) -> None:
+    import math
+    import random
+
+    import torch
+    torch.set_rng_state(state["torch"].cpu())
+    gauss = float(state["python_gauss"][0])
+    random.setstate((int(state["python_version"][0]),
+                     tuple(int(word) for word in state["python_internal"].tolist()),
+                     None if math.isnan(gauss) else gauss))
+
+
 def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
     """Write a sharded checkpoint with ``torch.distributed.checkpoint``.
 
@@ -72,11 +121,17 @@ def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
     module = _stateful_module(trainer.model)
     trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
     trainer.offload.drain(trainer.optimizer)
+    # The RNG state is per-rank and the ranks genuinely differ (data parallelism
+    # gives each one different batches), so it cannot share a key: DCP would read
+    # one rank's version as THE value and hand it to everybody.  The coordinate
+    # namespaces it, the same way PP stages need their own namespace.
+    coordinate = _coordinate(trainer)
     state = {
         "model": get_model_state_dict(module),
         "optimizer": get_optimizer_state_dict(module, trainer.optimizer),
         "bookkeeping": torch.tensor([trainer.global_step, trainer.optimizer_step],
                                     dtype=torch.int64),
+        f"rng.{coordinate[0]}.{coordinate[1]}.{coordinate[2]}": _rng_state(),
     }
     CheckpointManager(runtime=trainer.runtime).save_dcp(
         path, state=state,
@@ -105,12 +160,23 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
     module = _stateful_module(trainer.model)
     trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
     trainer.offload.drain(trainer.optimizer)
+    coordinate = _coordinate(trainer)
+    rng_key = f"rng.{coordinate[0]}.{coordinate[1]}.{coordinate[2]}"
     state = {
         "model": get_model_state_dict(module),
         "optimizer": get_optimizer_state_dict(module, trainer.optimizer),
         "bookkeeping": torch.zeros(2, dtype=torch.int64),
+        # NOT a stand-in: DCP reads the shape of the state dict it is handed to
+        # decide how much to read, so this has to be the same SHAPE as what was
+        # saved.  A zero-length placeholder failed with "Size mismatch between
+        # saved torch.Size([5056]) and current: torch.Size([0])", and the
+        # placeholder has to be built from the current state rather than a
+        # constant.  ``_rng_state`` is fixed-shape by construction -- that is
+        # what it is for; see its docstring.
+        rng_key: _rng_state(),
     }
     metadata = CheckpointManager(runtime=trainer.runtime).load_dcp(path, state=state)
+    _restore_rng(state[rng_key])
     set_model_state_dict(module, state["model"])
     set_optimizer_state_dict(module, trainer.optimizer, state["optimizer"])
     trainer.global_step = int(state["bookkeeping"][0].item())

@@ -221,28 +221,43 @@ def sequence_parallel_dropout(rank: int, world: int, dist, report: Report, optio
 # --------------------------------------------------------------------------- #
 @check("data-shard")
 def data_sharding(rank: int, world: int, dist, report: Report, options: dict) -> None:
-    """Every data-parallel rank must iterate a DIFFERENT slice of the dataset.
+    """Does a data-parallel rank get a way to shard the dataset?
 
-    ``Trainer.fit`` calls ``data.train_dataloader(dp_group=None, seed=...)`` --
-    ``dp_group`` is always None.  A provider therefore cannot shard by rank and
-    every rank walks the whole dataset in the same order, which turns data
-    parallelism into N replicas averaging identical gradients: it trains, it
-    just spends N times the compute for a batch of one rank's size.
-
-    The check models what a provider would do with the arguments it is handed.
+    ``Trainer.fit`` used to call ``data.train_dataloader(dp_group=None, ...)``
+    unconditionally, so a provider could not tell the ranks apart and every
+    rank walked the whole dataset in the same order -- data parallelism degraded
+    to N replicas averaging identical gradients.  ``Trainer.dp_process_group()``
+    now hands it the group built for the model.
     """
-    from aitrainer import FrameworkConfig
+    import torch
+    from torch import nn
 
-    seed = FrameworkConfig().seed
-    # A provider that only has (dp_group, seed) to work with, which is all the
-    # framework passes, has no way to tell the ranks apart.
-    shard_a = list(range(8))[rank::1][:4]
-    shard_b = list(range(8))[:4]
-    del seed
-    identical = shard_a == shard_b
-    report.say("data-shard", "note" if not identical else "FAIL",
-               f"with dp_group=None a provider can only shuffle identically on every rank; "
-               f"rank {rank} would see {shard_b if identical else shard_a}")
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(8, 8)
+
+        def forward(self, value):
+            return self.linear(value)
+
+    torch.manual_seed(5)
+    runtime = Runtime(device="cpu", init_process_group=False, seed=5)
+    config = (FrameworkConfig.from_dict({"parallel": {"dp_size": world},
+                                         "fsdp": {"enabled": True}})
+              if world > 1 else FrameworkConfig.from_dict({}))
+    model = parallelize(Model(), config=config, runtime=runtime) if world > 1 else Model()
+    trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=0.01),
+                      config=config, runtime=runtime,
+                      loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+    group = trainer.dp_process_group()
+    report.say("data-shard", "ok" if group is not None else "FAIL",
+               f"dp group handed to the provider: {'a real group' if group is not None else 'None'}"
+               + ("" if group is not None else
+                  "  <- every data-parallel rank would iterate the whole dataset"))
+    del runtime
 
 
 # --------------------------------------------------------------------------- #
@@ -259,6 +274,7 @@ def checkpoint_random_state(rank: int, world: int, dist, report: Report, options
     draws different randomness than the run that wrote it, and two runs of the
     same experiment diverge from there.
     """
+    import random
     import shutil
     import tempfile
     from pathlib import Path
@@ -290,48 +306,46 @@ def checkpoint_random_state(rank: int, world: int, dist, report: Report, options
                       config=config, runtime=runtime,
                       loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
     torch.manual_seed(555)
+    random.seed(555)
     trainer.fit([(torch.randn(2, 8), torch.randn(2, 8))], epochs=1)
-    expected = torch.randn(3).tolist()          # what the stream gives next
+    # Both streams: torch's, and Python's -- the latter advances inside `fit`
+    # whenever the provider or the model draws from `random`.
+    expected = [torch.randn(3).tolist(), random.random()]
 
     if rank == 0:
         shutil.rmtree(path, ignore_errors=True)
     dist.barrier()
     results = {}
-    for name, save, load in (("per_rank", "save_checkpoint", "load_checkpoint"),):
+    for name, save, load in (("per_rank", "save_checkpoint", "load_checkpoint"),
+                             ("sharded", "save_sharded", "load_sharded")):
         torch.manual_seed(555)
+        random.seed(555)
         trainer.fit([(torch.randn(2, 8), torch.randn(2, 8))], epochs=1)
-        getattr(trainer, save)(path / name)
-        dist.barrier()
+        # The per-rank format writes one complete file per rank and issues no
+        # collective, so each rank uses its OWN path -- two ranks sharing one
+        # collide with "Directory not empty" while publishing.  The sharded
+        # format is collective and requires the SAME path on every rank.  That
+        # difference is the reason there are two entry points at all.
+        target = path / (f"{name}_{rank}" if name == "per_rank" else name)
+        getattr(trainer, save)(target)
         torch.manual_seed(991)                   # deliberately move the stream
-        getattr(trainer, load)(path / name)
-        results[name] = float((torch.tensor(torch.randn(3).tolist())
-                               - torch.tensor(expected)).abs().max())
-        dist.barrier()
-    # The SHARDED path is reported separately and out of band: `save_sharded`
-    # stores model/optimizer/step counters and no RNG state at all, so a run
-    # resumed from one does not draw the same randomness as the run that wrote it.
-    # Measured below rather than assumed.
-    sharded_state = sorted(_state_keys())
+        random.seed(991)
+        getattr(trainer, load)(target)
+        results[name] = [float((torch.tensor(torch.randn(3).tolist())
+                                - torch.tensor(expected[0])).abs().max()),
+                         abs(random.random() - expected[1])]
     if rank == 0:
-        report.say("checkpoint-rng", "ok" if results["per_rank"] == 0.0 else "FAIL",
-                   f"save_checkpoint/load_checkpoint restores the stream "
-                   f"(next-draw diff {results['per_rank']:.1e})")
-        carries_rng = any("rng" in key for key in sharded_state)
-        report.say("checkpoint-rng", "ok" if carries_rng else "FAIL",
-                   f"save_sharded writes keys {sharded_state}"
-                   + ("" if carries_rng else
-                      "  <- no RNG state, so resuming from a sharded checkpoint does not "
-                      "reproduce the run being resumed"))
+        for name, label in (("per_rank", "save_checkpoint/load_checkpoint"),
+                            ("sharded", "save_sharded/load_sharded")):
+            distance, python_distance = results[name]
+            report.say("checkpoint-rng", "ok" if distance == 0.0 and python_distance < 1e-12
+                       else "FAIL",
+                       f"{label} restores the stream (next-draw diff {distance:.1e} torch, "
+                       f"{python_distance:.1e} python)"
+                       + ("" if distance == 0.0 and python_distance < 1e-12 else
+                          "  <- resuming does not reproduce the run being resumed"))
     shutil.rmtree(path, ignore_errors=True)
     del runtime
-
-
-def _state_keys() -> set[str]:
-    """The top-level keys ``save_sharded`` writes, read from the source."""
-    import re
-    source = (ROOT / "src" / "aitrainer" / "trainer" / "checkpointing.py").read_text()
-    body = source[source.index("def save_sharded"):source.index("def load_sharded")]
-    return set(re.findall(r'^\s+"(\w+)":', body, flags=re.MULTILINE))
 
 
 def main(argv: list[str] | None = None) -> int:

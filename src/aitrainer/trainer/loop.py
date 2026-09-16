@@ -20,7 +20,8 @@ def fit(trainer, data, *, epochs: int = 1, max_steps: int | None = None,
     for epoch in range(epochs):
         if hasattr(data, "set_epoch"):
             data.set_epoch(epoch)
-        loader = (data.train_dataloader(dp_group=None, seed=trainer.config.seed)
+        loader = (data.train_dataloader(dp_group=trainer.dp_process_group(),
+                                        seed=trainer.config.seed)
                   if hasattr(data, "train_dataloader") else data)
         logger.info("starting epoch with global_step=%d", trainer.global_step)
         for batch in loader:

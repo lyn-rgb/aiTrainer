@@ -35,7 +35,9 @@ def reduce_eval_stats(trainer: Any, local_sum: float, local_count: float) -> tup
 
 def evaluate(trainer: Any, data) -> dict[str, float]:
     torch = require_torch("aiTrainer training requires PyTorch; install the project's torch dependency")
-    loader = data.train_dataloader(dp_group=None, seed=trainer.config.seed) if hasattr(data, "train_dataloader") else data
+    loader = (data.train_dataloader(dp_group=trainer.dp_process_group(),
+                                    seed=trainer.config.seed)
+              if hasattr(data, "train_dataloader") else data)
     losses: list[float] = []
     trainer.model.eval()
     with torch.no_grad():

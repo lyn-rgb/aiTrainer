@@ -788,3 +788,31 @@ def test_pipeline_stages_keep_their_module_names():
     for payload in payloads:
         assert payload["ran"] is True, payload.get("error")
         assert payload["max_diff"] == 0.0
+
+
+def test_data_parallel_ranks_can_shard_the_dataset():
+    """``train_dataloader`` must receive the DP group, not ``None``.
+
+    It was passed ``None`` unconditionally, so a provider had no way to tell one
+    data-parallel rank from another and every rank iterated the whole dataset in
+    the same order.  Data parallelism then degrades to N replicas averaging
+    identical gradients: it trains, it just spends N times the compute for one
+    rank's batch -- and nothing reports it.
+    """
+    for payload in require_success(run_case("data_parallel_group_is_handed_over", 2,
+                                            hard_timeout=120.0)):
+        assert payload["group_size"] == 2, (
+            f"rank {payload['rank']} was handed no usable DP group "
+            f"(size {payload['group_size']}), so no rank can shard the dataset")
+        # The index a provider shards by.  A group that exists but gives both
+        # ranks the same index is no better than no group at all: every rank
+        # still reads shard 0.
+        assert sorted(payload["indices"].values()) == [0, 1], (
+            f"the DP group does not distinguish the ranks: {payload['indices']}")
+        # ...and that the group reaches the provider through the training loop,
+        # which is the line that was passing None.  Checking the helper alone
+        # would still pass with `fit` handing the provider None.
+        assert payload["fit_handed_it"], (
+            "Trainer.fit did not pass the DP group to train_dataloader")
+        assert payload["evaluate_handed_it"], (
+            "Trainer.evaluate did not pass the DP group to train_dataloader")
