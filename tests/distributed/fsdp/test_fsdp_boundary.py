@@ -28,9 +28,8 @@ def test_fsdp_tp_combination_is_accepted_at_startup():
 @pytest.mark.parametrize(
     ("dp_size", "tp_size", "pp_size", "sp_backend", "pp_schedule", "microbatches", "world_size"),
     [
-        (2, 2, 1, "ulysses", "none", 1, 4),
         (2, 2, 1, "megatron", "none", 1, 4),
-        (2, 2, 2, "ulysses", "1f1b", 2, 8),
+        (2, 2, 2, "megatron", "1f1b", 2, 8),
     ],
 )
 def test_fsdp_sp_tp_pp_combinations_are_accepted_at_startup(

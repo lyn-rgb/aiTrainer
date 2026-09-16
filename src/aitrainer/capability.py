@@ -50,7 +50,11 @@ def capability_matrix() -> tuple[Capability, ...]:
                    "which is the offload path this framework implements",
                    "fsdp_full_shard"),
         Capability("tp", CapabilityStatus.STABLE, "synchronous Column/Row Parallel Linear"),
-        Capability("sp", CapabilityStatus.STABLE, "synchronous Ulysses and sequence-parallel paths"),
+        Capability("sp", CapabilityStatus.STABLE,
+                   "sequence-parallel activations over the TP group; config selects only "
+                   "'megatron', and 'ulysses' is refused rather than accepted-and-ignored. "
+                   "The Ulysses head exchange itself is a separate explicit API that needs "
+                   "NCCL -- see UlyssesAttention / distributed_attention"),
         Capability("pp_gpipe_1f1b", CapabilityStatus.STABLE,
                    "non-interleaved pipeline schedules with synchronous P2P"),
         Capability("offload_optimizer", CapabilityStatus.STABLE, "CPU optimizer/state lifecycle"),

@@ -52,12 +52,25 @@ detected.
 
 ## Parallelism
 
-**TP** — Megatron-style `ColumnParallelLinear` / `RowParallelLinear` over an
-explicit TP group, with synchronous autograd-aware collectives. `parallelize()`
-applies TP sharding before FSDP wrapping, using orthogonal groups.
+**TP** — `torch.distributed.tensor.parallel.parallelize_module` with
+`ColwiseParallel` / `RowwiseParallel` styles, which projection is which coming
+from `TransformerTPPlan`, over an explicit TP group. The parameters become
+`DTensor`s, and that is load-bearing rather than incidental: it is what lets a
+sharded checkpoint tell one logical tensor apart from one rank's slice of it.
+`parallelize()` applies TP before FSDP wrapping, using orthogonal groups, and a
+plan that names no module is **refused** rather than leaving every rank a full
+replica.
 
-**SP** — fixed-shape and variable-length sequence-parallel utilities, Ulysses
-head exchange, RoPE offsets, `SequenceParallelLayerNorm`.
+**SP** — sequence-parallel activation of each `LayerNorm` over the TP group
+(`sequence_parallel_styles`). The sharding is written as a `Replicate ->
+Shard(1)` layout transition so DTensor's autograd supplies the gather and its
+reduce-scatter; a hand-rolled local `chunk` is measurably wrong, because its
+backward hands each rank only its own slice's contribution to the input
+gradient. Dropout stays **outside** the region on purpose — inside it, every
+rank draws the first block's mask. `sp_backend` is an on/off switch, not a
+choice of implementation: `megatron` and `ulysses` used to run identical code,
+and `ulysses` is now refused at validation instead of being silently
+reinterpreted.
 
 Two constraints worth knowing before you hit them:
 
@@ -70,9 +83,12 @@ Two constraints worth knowing before you hit them:
   evenly-divisible batches.
 - **Ulysses requires NCCL.** `all_to_all` has no Gloo implementation, so at
   `world_size > 1` every Ulysses path raises `RuntimeError: Backend gloo does not
-  support alltoall` on a CPU/Gloo job however it is configured. The
-  sequence-parallel paths that use TP collectives instead (scatter/gather,
-  `SequenceParallelLayerNorm`) do run on Gloo.
+  support alltoall` on a CPU/Gloo job however it is configured. That is why
+  `sp_backend='ulysses'` is refused rather than accepted: the head exchange is a
+  separate explicit API (`UlyssesAttention`, `distributed_attention`), and the
+  config value cannot select it on a backend where it cannot run. The norm
+  sequence sharding above uses only DTensor layout transitions and does run on
+  Gloo.
 
 **PP** — ordered stage planning, explicit tensor metadata, synchronous P2P, and
 `GPipeSchedule` / `OneFOneBSchedule` (non-interleaved). `parallel/pp_schedule.py`

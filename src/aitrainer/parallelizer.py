@@ -59,6 +59,12 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
     # independent otherwise: the plan decides the projections, and SP adds the
     # norms.  See ``plugins.transformer.TransformerTPPlan.styles`` for why SP
     # does not also move the projection layouts.
+    # A switch here, not a selector: this framework has ONE sequence-parallel
+    # implementation (the norms' activations are sharded over the TP group), so
+    # any non-'none' value installs it.  'ulysses' is refused in
+    # ParallelConfig.validate rather than reaching this line and silently
+    # meaning 'megatron'; the Ulysses head exchange is `UlyssesAttention`, an
+    # explicit API call, because it needs NCCL.
     sequence_parallel = config.parallel.sp_backend != "none"
     if config.parallel.tp_size > 1 or sequence_parallel:
         plan = tp_plan or TransformerTPPlan()

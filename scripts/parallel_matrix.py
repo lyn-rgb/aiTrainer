@@ -54,9 +54,13 @@ def _rank() -> int:
 
 
 def _specs(world_size: int) -> list[MatrixSpec]:
-    # SP is intentionally coupled to a TP group by ParallelConfig.  The
-    # fsdp_sp entry exercises Megatron-style sequence sharding, while the
-    # fsdp_sp_tp entry exercises the Ulysses/TP path.
+    # SP is intentionally coupled to a TP group by ParallelConfig.  There was a
+    # second entry here named fsdp_sp_tp and described as "the Ulysses/TP path";
+    # it differed from fsdp_sp only in `sp_backend`, which selects nothing (one
+    # SP implementation), so the two ran the same configuration -- measured as
+    # bit-identical losses.  It is deleted rather than renamed: it contributed no
+    # coverage, and its name invited the reading that Ulysses was being
+    # exercised.
     sp_size = 2 if world_size < 2 else 2
     sp_dp = world_size // sp_size if world_size >= 2 and world_size % sp_size == 0 else 1
     pp_dp = world_size // 4 if world_size >= 4 and world_size % 4 == 0 else 1
@@ -64,12 +68,10 @@ def _specs(world_size: int) -> list[MatrixSpec]:
     return [
         MatrixSpec("fsdp", "FSDP2 fully_shard", world_size, 1, 1, "none", "none", 1, world_size),
         MatrixSpec("fsdp_sp", "FSDP + sequence parallel", sp_dp, sp_size, 1, "megatron", "none", 1, sp_dp * sp_size),
-        MatrixSpec("fsdp_sp_tp", "FSDP + sequence parallel + tensor parallel", sp_dp, sp_size, 1,
-                   "ulysses", "none", 1, sp_dp * sp_size),
         # Use a four-rank structural validation for this entry so a two-rank
         # smoke job still checks the combination rather than failing merely
         # because PP needs two independent axes.
-        MatrixSpec("fsdp_sp_tp_pp", "FSDP + SP + TP + PP", pp_dp, 2, 2, "ulysses", "gpipe", 2, pp_world),
+        MatrixSpec("fsdp_sp_tp_pp", "FSDP + SP + TP + PP", pp_dp, 2, 2, "megatron", "gpipe", 2, pp_world),
     ]
 
 

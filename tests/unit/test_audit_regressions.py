@@ -103,11 +103,11 @@ def test_apply_candidate_preserves_fields_it_does_not_name():
     """Rebuilding the dataclasses dropped sp_backend, pp_schedule and FSDP settings."""
     config = FrameworkConfig(
         planning=PlanningConfig(enabled=True, allow_rewrite=True),
-        parallel=ParallelConfig(dp_size=2, tp_size=2, pp_size=1, sp_backend="ulysses"),
+        parallel=ParallelConfig(dp_size=2, tp_size=2, pp_size=1, sp_backend="megatron"),
         fsdp=FSDPConfig(enabled=True,
                         mixed_precision=MixedPrecisionConfig(enabled=True, dtype="float16")))
     updated = apply_candidate(config, PlanCandidate(4, 2, 1, "fsdp", 0.0, ("t",)))
-    assert updated.parallel.sp_backend == "ulysses"
+    assert updated.parallel.sp_backend == "megatron"
     # mixed_precision is the probe that survives: apply_candidate rebuilds
     # FSDPConfig, and naming only `enabled` used to drop the nested config
     # wholesale.  forward_prefetch/execution_trace_complete used to serve here

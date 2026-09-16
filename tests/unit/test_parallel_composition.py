@@ -6,7 +6,7 @@ from aitrainer.parallel.pp_p2p import P2PCommunicator
 
 def test_fsdp_sp_tp_pp_configuration_is_validated_as_supported():
     parallel = ParallelConfig(dp_size=2, tp_size=2, pp_size=2,
-                              sp_backend="ulysses", pp_schedule="gpipe",
+                              sp_backend="megatron", pp_schedule="gpipe",
                               num_microbatches=2)
     validate(FrameworkConfig(parallel=parallel, fsdp=FSDPConfig(enabled=True)), world_size=8)
 

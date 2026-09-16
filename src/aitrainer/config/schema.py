@@ -29,6 +29,26 @@ class ParallelConfig:
             raise ConfigurationError(f"unknown parallel.sp_backend={self.sp_backend!r}")
         if self.sp_backend != "none" and self.tp_size <= 1:
             raise ConfigurationError("parallel.sp_backend requires tp_size>1")
+        if self.sp_backend == "ulysses":
+            # Refused rather than accepted-and-ignored.  `parallelize` installs
+            # the norm sequence sharding for any non-'none' value (there is one
+            # SP implementation), so this setting used to run Megatron-style SP
+            # while its name, its comments and the validation matrix all said
+            # Ulysses -- measured: `fsdp_sp` and `fsdp_sp_tp` in
+            # scripts/parallel_matrix.py, which differed only in this field,
+            # produced bit-identical losses.
+            #
+            # Wiring it up is not a rename: the head exchange needs all_to_all,
+            # Gloo has no all_to_all, so every world_size>1 Ulysses path is
+            # CUDA/NCCL-only and cannot be verified on this host.  Keeping the
+            # value in the enum and refusing it is the same treatment
+            # `compile.enabled` gets, and it leaves the wire-in point visible.
+            raise ConfigurationError(
+                "parallel.sp_backend='ulysses' is not wired into the model path: the "
+                "head exchange needs NCCL (Gloo has no all_to_all), so parallelize() "
+                "installs the norm sequence sharding for any non-'none' value. Use "
+                "'megatron', or call UlyssesAttention explicitly on the projections "
+                "you want exchanged.")
         if self.pp_schedule not in {"none", "gpipe", "1f1b"}:
             raise ConfigurationError(f"unknown parallel.pp_schedule={self.pp_schedule!r}")
         if self.pp_size == 1 and self.pp_schedule != "none":
