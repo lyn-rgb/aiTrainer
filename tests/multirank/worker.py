@@ -1143,6 +1143,55 @@ def _tp_group(world: int, rank: int):
     return ProcessGroups.create(mapping).tp_group
 
 
+@case("interior_pipeline_stage_trains")
+def interior_pipeline_stage_trains(rank: int, world: int, dist, options: dict) -> dict:
+    """Every stage of a pipeline must receive gradients, interior ones included.
+
+    ``PipelineSchedule.run_middle_stage`` recorded this stage's INPUT (received
+    from upstream) and backpropagated the downstream gradient through THAT.  The
+    input's graph belongs to the upstream stage, in another process, so backward
+    through it computes nothing here: every parameter of an interior stage kept
+    ``.grad is None`` for the whole run, and the gradient handed upstream had not
+    been multiplied by this stage's Jacobian.
+
+    Measured at pp=4 before the fix: stages 0 and 3 updated, stages 1 and 2 had
+    ``grad is None`` on all 16 parameters, the loss was right to 1.8e-07 and
+    ``backward_complete`` was True.  Nothing raised.  At pp=2 the interior path
+    is never taken -- there is no interior stage -- which is how this survived.
+
+    Reported per rank: how many parameters have no gradient at all, and the
+    largest gradient, so a stage that is merely small is distinguishable from one
+    that is disconnected.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime
+    from aitrainer.parallelizer import parallelize
+
+    schedule = options.get("schedule", "gpipe")
+    config = FrameworkConfig.from_dict({
+        "parallel": {"pp_size": world, "pp_schedule": schedule, "num_microbatches": world}})
+    torch.manual_seed(1234)
+    runtime = Runtime(device="cpu", seed=1234)
+    module = torch.nn.Sequential(*[
+        torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU()) for _ in range(world)])
+    model = parallelize(module, config=config, runtime=runtime)
+    loss_fn = lambda output, batch: torch.nn.functional.mse_loss(output, batch[1])
+    generator = torch.Generator().manual_seed(7)
+    batch = (torch.randn(4, 8, generator=generator), torch.randn(4, 8, generator=generator))
+    result = model.pipeline_step(batch, loss_fn=loss_fn, scaler=None, accumulation_steps=1)
+    inner = model.module if hasattr(model, "stage_id") else model
+    graded = [parameter.grad for parameter in inner.parameters()]
+    return {"rank": rank, "stage": int(getattr(model, "stage_id", -1)), "pp_size": world,
+            "schedule": schedule,
+            "parameters": len(graded),
+            "without_gradient": sum(1 for grad in graded if grad is None),
+            "max_grad": max((float(grad.abs().max()) for grad in graded if grad is not None),
+                            default=0.0),
+            "loss": float(result.loss) if torch.is_tensor(result.loss) else 0.0,
+            "backward_complete": bool(getattr(result, "backward_complete", False))}
+
+
 @case("profiler_captures_collectives")
 def profiler_captures_collectives(rank: int, world: int, dist, options: dict) -> dict:
     """``Profiler.capture`` must find the collectives it cannot be wired into.

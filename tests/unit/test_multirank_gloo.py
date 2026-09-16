@@ -861,3 +861,47 @@ def test_profiler_capture_measures_real_collectives():
     assert len({payload["collectives"] for payload in payloads}) == 1, (
         f"ranks disagree on the collective count: "
         f"{[payload['collectives'] for payload in payloads]}")
+
+
+@pytest.mark.parametrize("schedule", ["gpipe", "1f1b"])
+def test_every_pipeline_stage_receives_gradients(schedule):
+    """An interior pipeline stage must train, not just pass gradients through.
+
+    ``run_middle_stage`` backpropagated the downstream gradient through its own
+    INPUT -- a tensor received from another process, whose graph holds none of
+    this stage's parameters.  An interior stage therefore never accumulated a
+    gradient on any parameter, while the loss stayed correct and
+    ``backward_complete`` was True.
+
+    Four stages, because the interior path only exists when the world has an
+    interior: at pp=2 this is never exercised, and every two-stage run in the
+    suite was green.
+
+    Both schedules, because they reach the interior by different code:
+    ``GPipeSchedule.run_middle_stage`` and ``OneFOneBSchedule._run`` each
+    backpropagated the received activation instead of the produced output, and
+    each had to be fixed separately.
+
+    The in-process protocol simulator did not catch either.  Its assertions are
+    about what gets SENT -- message order, stage labels, microbatch labels -- and
+    the forwarded gradient is non-empty with the right shape, so a gradient that
+    never passed through this stage's Jacobian looks the same to it as one that
+    did.
+    """
+    payloads = require_success(run_case("interior_pipeline_stage_trains", 4,
+                                        options={"schedule": schedule}, hard_timeout=180.0))
+    assert len(payloads) == 4
+    stages = sorted(payload["stage"] for payload in payloads)
+    assert stages == [0, 1, 2, 3], f"expected four stages, got {stages}"
+    assert {payload["schedule"] for payload in payloads} == {schedule}
+    for payload in payloads:
+        assert payload["parameters"] > 0
+        assert payload["without_gradient"] == 0, (
+            f"stage {payload['stage']} has {payload['without_gradient']} parameters with no "
+            "gradient at all, so it is not training")
+        assert payload["max_grad"] > 0.0, (
+            f"stage {payload['stage']} has only zero gradients")
+        assert payload["backward_complete"] is True
+    # Only the last stage owns the loss; the others report zero by design.
+    last = max(payloads, key=lambda item: item["stage"])
+    assert last["loss"] > 0.0

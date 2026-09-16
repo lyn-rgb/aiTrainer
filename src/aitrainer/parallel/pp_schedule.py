@@ -242,24 +242,56 @@ class GPipeSchedule(PipelineSchedule):
         return ScheduleOutput(None, tuple(activations), len(activations), True)
 
     def run_middle_stage(self, input_specs: list[TensorSpec] | None = None) -> ScheduleOutput:
+        """Forward through this stage and backpropagate through BOTH ends of it.
+
+        The two lists kept here are not interchangeable, and an earlier version
+        of this method treated them as if they were: it recorded ``activation``
+        -- this stage's INPUT, received from the upstream stage -- and then
+        backpropagated the downstream gradient through THAT.  The input's graph
+        belongs to the upstream stage, in another process, so backward through it
+        computes nothing here: every parameter of this stage kept ``.grad is
+        None`` forever, and ``activation.grad`` came back as the incoming
+        gradient unchanged, so the upstream stage received a gradient that had
+        not been multiplied by this stage's Jacobian.
+
+        Measured at pp=4 (three interior-free axes): stages 0 and 3 updated,
+        stages 1 and 2 kept ``grad is None`` on all 16 parameters, loss was
+        correct to 1.8e-07 and ``backward_complete`` was True.  At pp=2 there is
+        no interior stage, which is why this survived -- first and last stages
+        were always right, and the interior path is the one no two-stage run
+        exercises.
+
+        Backpropagating through ``output`` does both jobs at once: it fills this
+        stage's parameter gradients, and it fills ``activation.grad`` with the
+        input gradient to hand upstream.  The received activation is a leaf
+        (``recv_forward`` allocates and marks it), so its ``.grad`` is populated
+        by that call.
+        """
         if self.communicator.is_first or self.communicator.is_last:
             raise PipelineScheduleError("run_middle_stage requires an interior pipeline stage")
         explicit = input_specs is not None
         total = len(input_specs) if explicit else self.num_microbatches
         activations: list[Any] = []
-        specs: list[TensorSpec] = []
+        outputs: list[Any] = []
+        input_specs_used: list[TensorSpec] = []
+        output_specs: list[TensorSpec] = []
         for index in range(total):
             activation, spec = self._recv_forward_any(input_specs[index] if explicit else None)
             output = _call_module(self.stage_module, activation)
             next_spec = self._input_spec(output, spec.microbatch if spec is not None else index, "forward")
             self.communicator.send_forward(output, spec=next_spec)
             activations.append(activation)
-            specs.append(spec)
-        for index in range(len(activations) - 1, -1, -1):
-            grad = self._recv_backward_any(specs[index])
-            _autograd_backward(activations[index], grad)
+            outputs.append(output)
+            input_specs_used.append(spec)
+            output_specs.append(next_spec)
+        for index in range(len(outputs) - 1, -1, -1):
+            # The gradient arriving from downstream corresponds to what this
+            # stage SENT, so it belongs to ``outputs[index]``, and the spec used
+            # to receive it is the one the send was described with.
+            grad = self._recv_backward_any(output_specs[index])
+            _autograd_backward(outputs[index], grad)
             self.communicator.send_backward(activations[index].grad,
-                                            spec=self._backward_spec(specs[index]))
+                                            spec=self._backward_spec(input_specs_used[index]))
         self.communicator.drain()
         self._backward_complete = True
         return ScheduleOutput(None, (), len(activations), True)
@@ -339,7 +371,11 @@ class OneFOneBSchedule(PipelineSchedule):
             return ScheduleOutput(None, (), 0, True)
         denom = self._window_denominator(count)
         pending: list[Any] = []
-        records: list[tuple[Any, TensorSpec | None, Any | None]] = []
+        # (target to backpropagate through, tensor whose .grad goes upstream,
+        #  spec to RECEIVE the downstream gradient with, spec to SEND ours with,
+        #  loss).  The first two are different tensors for an interior stage, and
+        #  conflating them was the defect: see ``backward`` below.
+        records: list[tuple[Any, Any, TensorSpec | None, TensorSpec | None, Any | None]] = []
         outputs: list[Any] = []
         losses: list[Any] = []
 
@@ -348,34 +384,49 @@ class OneFOneBSchedule(PipelineSchedule):
                 output = _call_module(self.stage_module, batches[index])
                 spec = self._input_spec(output, index, "forward")
                 pending.append(self.communicator.send_forward_async(output, spec=spec))
-                records.append((output, spec, None))
+                records.append((output, output, spec, None, None))
                 return
             activation, spec = self._recv_forward_any(input_specs[index] if explicit else None)
             output = _call_module(self.stage_module, activation)
             if self.communicator.is_last:
-                records.append((activation, spec, self._loss(output, batches[index]) / denom))
+                records.append((output, activation, None, spec,
+                                self._loss(output, batches[index]) / denom))
             else:
                 next_spec = self._input_spec(output, spec.microbatch if spec is not None else index,
                                              "forward")
                 pending.append(self.communicator.send_forward_async(output, spec=next_spec))
-                records.append((activation, spec, None))
+                records.append((output, activation, next_spec, spec, None))
             outputs.append(output)
 
-        def backward(record: tuple[Any, TensorSpec | None, Any | None]) -> None:
-            activation, spec, loss = record
+        def backward(record: tuple[Any, Any, TensorSpec | None, TensorSpec | None, Any | None]) -> None:
+            target, handoff, recv_spec, send_spec, loss = record
             if is_first:
                 # The first stage has no upstream peer, so it receives its
                 # gradient and stops -- it must NOT try to send one.  (Falling
                 # through also reads ``.grad`` off its own module output, which is
                 # not a leaf and has no gradient populated.)
-                _autograd_backward(activation, self._recv_backward_any(None if dynamic else spec))
+                #
+                # For this stage ``target`` IS its output, which is what the
+                # downstream gradient corresponds to.
+                _autograd_backward(target, self._recv_backward_any(None if dynamic else recv_spec))
                 return
             if self.communicator.is_last:
+                # Backward from the loss populates ``handoff``'s gradient (the
+                # received activation, a leaf) on the way to this stage's
+                # parameters, so no separate call is needed here.
                 self._backward(loss)
             else:
-                _autograd_backward(activation, self._recv_backward_any(None if dynamic else spec))
+                # Through the OUTPUT, not the received activation.  The gradient
+                # from downstream corresponds to what this stage SENT; the
+                # activation's graph belongs to the upstream stage, in another
+                # process, so backward through it fills in nothing here -- it left
+                # every interior parameter at ``grad is None`` for the whole run
+                # while the loss stayed correct.  Going through the output fills
+                # this stage's parameters AND ``handoff.grad``, which is the input
+                # gradient to pass upstream.
+                _autograd_backward(target, self._recv_backward_any(None if dynamic else recv_spec))
             pending.append(self.communicator.send_backward_async(
-                activation.grad, spec=self._backward_spec(spec)))
+                handoff.grad, spec=self._backward_spec(send_spec)))
             if loss is not None:
                 losses.append(loss.detach() * denom)
 

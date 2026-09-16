@@ -32,7 +32,7 @@ Validation happens in three places, each with one job:
 | Layer | Owns |
 |---|---|
 | `config/schema.py` | per-config invariants (types, ranges, self-consistency) |
-| `capability.validate_combinations` | rules that span siblings (`dp_size>1` needs FSDP, microbatch interleave rejects PP, ...) |
+| `capability.validate_combinations` | rules that span siblings (`dp_size>1` needs FSDP, `compile.enabled` is refused, an overlap switch needs its axis) |
 | `capability.validate_capabilities` | the public entry point: schema first, then combinations |
 
 `trainer` constructs once and validates once. `capability_matrix()` reports what
@@ -216,8 +216,20 @@ a reviewed candidate requires `PlanningConfig(allow_rewrite=True)`.
 ## Validation matrix
 
 ```bash
+# Correctness against a single-process baseline, plus throughput and peak
+# memory, for every combination this host can run -- and a report.
+python scripts/verify_parallel.py --report-dir artifacts/verify
+
 bash scripts/run_all_tests.sh --world-size 2 --report-dir artifacts/server_report
 ```
+
+`verify_parallel.py` trains the same small model three ways and compares them on
+forward output, loss, gradients and the parameter update.  It found two real
+defects that every existing test missed: both pipeline schedules backpropagated
+a stage's received *activation* instead of its produced *output*, which left
+every interior stage's parameters at `grad is None` for the whole run while the
+loss stayed correct and `backward_complete` reported true.  At pp=2 there is no
+interior stage, so no two-stage run could see it.
 
 Use `--world-size 4` (or `8`) to execute the PP combination entry as a real job;
 a two-rank run records it as structurally validated but blocked by its required
