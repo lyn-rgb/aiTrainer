@@ -89,9 +89,11 @@ def capability_matrix() -> tuple[Capability, ...]:
         Capability("parameter_prefetch", CapabilityStatus.EXPERIMENTAL,
                    "trace-validated parameter fetch/prefetch with bounded residency", "offload_parameter"),
         Capability("pp_p2p_overlap", CapabilityStatus.EXPERIMENTAL,
-                   "the preposted receive API (post_recv_forward/backward, wait_posted) "
-                   "has no caller and the 1F1B path issues async sends unconditionally, "
-                   "so this switch currently only raises when pp_size<=1", "pp_gpipe_1f1b"),
+                   "the async-send half is wired and the 1F1B path issues it "
+                   "unconditionally, so this switch has nothing left to control -- it "
+                   "only rejects pp_size<=1. The preposted receive API it was named for "
+                   "(post_recv_forward/post_recv_backward/wait_posted) was removed as "
+                   "dead code; receive is synchronous only", "pp_gpipe_1f1b"),
         Capability("transfer_overlap", CapabilityStatus.EXPERIMENTAL,
                    "bounded H2D/D2H scheduler with synchronous fallback", "offload"),
         Capability("tp_bulk_overlap_sequence_parallel", CapabilityStatus.EXPERIMENTAL,

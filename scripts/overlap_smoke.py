@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 def run() -> dict[str, object]:
-    from aitrainer.lifecycle import AsyncOp, AsyncState, ExecutionScheduler
+    from aitrainer.core.lifecycle import AsyncOp, AsyncState, ExecutionScheduler
     from aitrainer.overlap import (GradientBucket, MicrobatchInterleaveScheduler,
                                    ParameterPrefetchCoordinator, PingPongBuffer)
 
