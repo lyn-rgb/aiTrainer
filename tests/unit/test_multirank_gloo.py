@@ -830,3 +830,34 @@ def test_data_parallel_ranks_can_shard_the_dataset():
             "Trainer.fit did not pass the DP group to train_dataloader")
         assert payload["evaluate_handed_it"], (
             "Trainer.evaluate did not pass the DP group to train_dataloader")
+
+
+def test_profiler_capture_measures_real_collectives():
+    """``Profiler.capture`` must report an overlap it actually observed.
+
+    The metric was structurally 0.0 because nothing ever called
+    ``record_async``/``record_wait``: the collectives worth measuring live inside
+    DTensor and FSDP2 as autograd nodes, with no call site to hang a timer on.
+    Reading them out of a ``torch.profiler`` trace is the only way in.
+
+    Both halves are asserted, because either alone is satisfiable by a broken
+    implementation: a profiler that finds nothing reports 0.0 and looks like "no
+    overlap", and one that never runs reports 0.0 too.  So the count has to be
+    positive AND the split has to be a split.
+    """
+    payloads = require_success(run_case("profiler_captures_collectives", 2,
+                                        hard_timeout=180.0))
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload["collectives"] > 0, (
+            f"rank {payload['rank']} captured no collectives, so the metric is the "
+            "structural zero it used to be")
+        assert payload["timeline_entries"] == payload["collectives"], (
+            "every captured collective must reach the timeline")
+        assert payload["exposed_seconds"] + payload["hidden_seconds"] > 0
+        assert 0.0 <= payload["overlap_ratio"] <= 1.0
+    # The ranks run the same three steps, so they must agree on how many
+    # collectives there were; the times differ legitimately between ranks.
+    assert len({payload["collectives"] for payload in payloads}) == 1, (
+        f"ranks disagree on the collective count: "
+        f"{[payload['collectives'] for payload in payloads]}")

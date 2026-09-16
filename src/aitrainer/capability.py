@@ -77,9 +77,15 @@ def capability_matrix() -> tuple[Capability, ...]:
         Capability("fused_adamw", CapabilityStatus.EXPERIMENTAL,
                    "reference update path; no custom CUDA kernel", "kernel_eager_fallback"),
         Capability("overlap_metrics", CapabilityStatus.EXPERIMENTAL,
-                   "operation counts, elapsed time and in-flight peaks are real; "
-                   "overlapped_seconds has no writer yet, so a controller's "
-                   "overlap_ratio is structurally zero"),
+                   "operation counts, elapsed time and in-flight peaks are real. "
+                   "Profiler.capture() measures exposed vs hidden communication by "
+                   "reading a torch.profiler trace, which is the only way to reach the "
+                   "collectives inside DTensor/FSDP2 -- they are autograd nodes with no "
+                   "call site to instrument, so record_async/record_wait had no writer "
+                   "and the metric was structurally 0.0. Note the separate, still-zero "
+                   "one: OverlapController's OverlapRecord.overlapped_seconds has no "
+                   "writer either, and its overlap_ratio is 0.0 for a synchronous "
+                   "baseline -- correct there, but it cannot report a real overlap"),
         Capability("async_overlap", CapabilityStatus.EXPERIMENTAL,
                    "requires caller-owned validated async handles; disabled by default", "overlap_metrics"),
         Capability("gradient_bucket_overlap", CapabilityStatus.EXPERIMENTAL,

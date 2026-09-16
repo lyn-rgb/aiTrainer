@@ -1143,6 +1143,54 @@ def _tp_group(world: int, rank: int):
     return ProcessGroups.create(mapping).tp_group
 
 
+@case("profiler_captures_collectives")
+def profiler_captures_collectives(rank: int, world: int, dist, options: dict) -> dict:
+    """``Profiler.capture`` must find the collectives it cannot be wired into.
+
+    The all-gathers and reduce-scatters inside DTensor and FSDP2 are autograd
+    nodes in torch; this framework has no call site to hang a timer on, which is
+    why ``record_async``/``record_wait`` were never called and ``overlap_ratio``
+    was structurally 0.0.  ``torch.profiler`` sees all of them, so the metric
+    comes from a trace instead.
+
+    Measured here rather than assumed: on CPU/Gloo the transfer runs on a
+    backend worker thread, so the intervals genuinely interleave with the main
+    thread and ``exposed`` versus ``hidden`` is a real split rather than a
+    foregone 100/0.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+    from aitrainer.profiler import Profiler
+
+    config = FrameworkConfig.from_dict({"parallel": {"dp_size": world}, "fsdp": {"enabled": True}})
+    torch.manual_seed(5)
+    module = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.ReLU(), torch.nn.Linear(64, 8))
+    runtime = Runtime(device="cpu", seed=5)
+    wrapped = parallelize(module, config=config, runtime=runtime)
+    optimizer = torch.optim.SGD(wrapped.parameters(), lr=0.01)
+    trainer = Trainer(wrapped, optimizer, config=config, runtime=runtime,
+                      loss_fn=lambda output, batch: (output * batch[1]).sum())
+    generator = torch.Generator().manual_seed(11)
+    batches = [(torch.randn(8, 64, generator=generator), torch.randn(8, 8, generator=generator))
+               for _ in range(3)]
+    trainer.fit(batches[:1], epochs=1)          # warm up before measuring
+
+    profiler = Profiler()
+    with profiler.capture():
+        for batch in batches:
+            trainer.train_step(batch)
+    summary = profiler.summary()
+    dist.barrier()
+    return {"rank": rank,
+            "collectives": summary["collectives"],
+            "exposed_seconds": summary["wait_seconds"],
+            "hidden_seconds": summary["overlapped_seconds"],
+            "overlap_ratio": summary["overlap_ratio"],
+            "timeline_entries": summary["timeline_events"]}
+
+
 @case("data_parallel_group_is_handed_over")
 def data_parallel_group_is_handed_over(rank: int, world: int, dist, options: dict) -> dict:
     """``Trainer.dp_process_group()`` must hand the data provider a usable group.

@@ -146,10 +146,28 @@ deliberately: removing them would silently widen the set of accepted
 configurations. Treat them as reserved configuration, not as knobs.
 
 `Profiler` exposes timeline, wait/overlap, pipeline-bubble, GPU-idle, allocation
-and buffer-pool methods, but nothing instantiates it yet — create and populate
-one yourself. `MicrobatchInterleaveScheduler` handles exactly two static TP
-microbatches and rejects PP, dynamic-control-flow and activation-offload
-combinations at startup, but it is not reachable from `Trainer`.
+and buffer-pool methods, and nothing instantiates it for you — create one and
+wrap the block you want measured:
+
+```python
+profiler = Profiler()
+with profiler.capture():
+    trainer.fit(batches, epochs=1)
+profiler.summary()["overlap_ratio"]     # measured, not structural
+```
+
+`capture()` reads a `torch.profiler` trace back, because the collectives worth
+measuring are the ones inside DTensor and FSDP2 — autograd nodes with no call
+site to hang a timer on. Matching is on the transfer itself: one collective
+appears in the trace as a nest (`FSDP::all_gather` wrapping `c10d::_allgather_base_`,
+two `*_copy_in/out`, and the `gloo:`/`nccl:` transfer), so counting by operation
+name would report it three times over. Exposed time is the part of each transfer
+no compute covers. On CPU/Gloo the backend transfers on a worker thread, so the
+split is real there; on CUDA it is the number the overlap work exists to move.
+
+`MicrobatchInterleaveScheduler` handles exactly two static TP microbatches and
+rejects PP, dynamic-control-flow and activation-offload combinations at startup,
+but it is not reachable from `Trainer`.
 
 ## Training
 
