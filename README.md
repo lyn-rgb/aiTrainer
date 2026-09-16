@@ -165,9 +165,13 @@ name would report it three times over. Exposed time is the part of each transfer
 no compute covers. On CPU/Gloo the backend transfers on a worker thread, so the
 split is real there; on CUDA it is the number the overlap work exists to move.
 
-`MicrobatchInterleaveScheduler` handles exactly two static TP microbatches and
-rejects PP, dynamic-control-flow and activation-offload combinations at startup,
-but it is not reachable from `Trainer`.
+`kernels/fused.py` holds numerically transparent reference implementations of
+norm/MLP/residual/AdamW.  They are a reference, not a dispatch layer: a
+`KernelBackend` registry once sat on top of them, and it was deleted because
+PyTorch's own dispatcher already picks the fast implementation for these
+operators (`F.layer_norm` is the CUDA fused kernel, SDPA dispatches to
+flash/mem-efficient/math), no third-party backend was ever registered, and
+nothing read the record of which one ran.
 
 ## Training
 

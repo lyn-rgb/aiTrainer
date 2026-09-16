@@ -1,14 +1,7 @@
 import pytest
 
 from aitrainer.capability import UnsupportedCombinationError, validate_capabilities
-from aitrainer.config import AdvancedOverlapConfig, FrameworkConfig, FSDPConfig, ParallelConfig
-
-
-def test_gradient_bucket_overlap_rejects_fsdp_reducer_conflict():
-    config = FrameworkConfig(fsdp=FSDPConfig(enabled=True),
-                             overlap=AdvancedOverlapConfig(enable_gradient_bucket_overlap=True))
-    with pytest.raises(UnsupportedCombinationError):
-        validate_capabilities(config)
+from aitrainer.config import AdvancedOverlapConfig, FrameworkConfig, ParallelConfig
 
 
 def test_overlap_switches_require_matching_parallel_axis():

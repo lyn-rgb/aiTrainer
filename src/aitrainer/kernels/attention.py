@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .backend import KernelCapability, KernelStatus
-
 
 def flash_attention_available() -> bool:
     try:
@@ -14,35 +12,6 @@ def flash_attention_available() -> bool:
                     hasattr(torch.backends, "cuda") and torch.backends.cuda.flash_sdp_enabled())
     except ImportError:
         return False
-
-
-def attention_kernel_backend() -> str | None:
-    """The *registerable* attention backend, or ``None`` when only eager applies.
-
-    ``attention_capability()`` reports ``backend="eager"`` on a machine without
-    flash, but "eager" is reserved for the registry's mandatory fallback and
-    ``KernelBackend.register`` refuses it.  Callers deciding whether to register
-    anything must consult this instead.
-    """
-    return "flash" if flash_attention_available() else None
-
-
-def attention_capability() -> KernelCapability:
-    """Describe the attention kernel that will actually serve requests.
-
-    The result is a description, not a registration token: when it reports
-    ``backend="eager"`` the built-in fallback is in use and there is nothing to
-    register -- ``KernelBackend.select`` supplies that selection itself.
-    """
-    available = flash_attention_available()
-    return KernelCapability(
-        "attention", "flash" if available else "eager",
-        KernelStatus.AVAILABLE if available else KernelStatus.FALLBACK,
-        supported_dtypes=("float16", "bfloat16") if available else ("float16", "bfloat16", "float32"),
-        devices=("cuda",) if available else ("cpu", "cuda"),
-        layouts=("contiguous",), max_rank=4, error_budget=1e-4 if available else 2 ** -8,
-        reason="PyTorch SDPA dispatch" if available else
-               "manual eager attention; exact in the input dtype, bounded by its precision")
 
 
 def _eager_attention(query: Any, key: Any, value: Any, mask: Any | None,

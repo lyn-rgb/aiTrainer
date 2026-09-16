@@ -206,11 +206,9 @@ class AdvancedOverlapConfig:
     operation count remains a strictly positive safety limit.
     """
     enable_tp_bulk_overlap: bool = False
-    enable_gradient_bucket_overlap: bool = False
     enable_optimizer_param_gather_overlap: bool = False
     enable_pp_p2p_overlap: bool = False
     enable_transfer_overlap: bool = False
-    enable_microbatch_interleave: bool = False
     parameter_prefetch_bytes: int = 0
     max_inflight_ops: int = 2
     max_inflight_bytes: int = 0
@@ -218,9 +216,8 @@ class AdvancedOverlapConfig:
     drain_timeout_s: float = 60.0
 
     def validate(self) -> None:
-        for name in ("enable_tp_bulk_overlap", "enable_gradient_bucket_overlap",
-                     "enable_optimizer_param_gather_overlap", "enable_pp_p2p_overlap", "enable_transfer_overlap",
-                     "enable_microbatch_interleave"):
+        for name in ("enable_tp_bulk_overlap", "enable_optimizer_param_gather_overlap",
+                     "enable_pp_p2p_overlap", "enable_transfer_overlap"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"overlap.{name} must be bool")
         for name in ("parameter_prefetch_bytes", "max_inflight_ops", "max_inflight_bytes",

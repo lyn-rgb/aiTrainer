@@ -66,16 +66,6 @@ def capability_matrix() -> tuple[Capability, ...]:
                    "saved_tensors_hooks with explicit context and CPU staging"),
         Capability("offload_nvme", CapabilityStatus.UNSUPPORTED, "NVMe/AIO is outside the stable boundary"),
         Capability("offload", CapabilityStatus.STABLE, "explicit CPU offload modes"),
-        Capability("kernel_eager_fallback", CapabilityStatus.EXPERIMENTAL,
-                   "KernelBackend exposes eager fallback selection, but no model path "
-                   "consults the registry yet -- kernels/attention.py and kernels/fused.py "
-                   "run eager directly"),
-        Capability("flash_attention", CapabilityStatus.EXPERIMENTAL,
-                   "uses PyTorch SDPA/flash dispatch only when probed available", "kernel_eager_fallback"),
-        Capability("fused_norm_mlp_residual", CapabilityStatus.EXPERIMENTAL,
-                   "numerically transparent eager reference implementation", "kernel_eager_fallback"),
-        Capability("fused_adamw", CapabilityStatus.EXPERIMENTAL,
-                   "reference update path; no custom CUDA kernel", "kernel_eager_fallback"),
         Capability("overlap_metrics", CapabilityStatus.EXPERIMENTAL,
                    "operation counts, elapsed time and in-flight peaks are real. "
                    "Profiler.capture() measures exposed vs hidden communication by "
@@ -88,8 +78,6 @@ def capability_matrix() -> tuple[Capability, ...]:
                    "baseline -- correct there, but it cannot report a real overlap"),
         Capability("async_overlap", CapabilityStatus.EXPERIMENTAL,
                    "requires caller-owned validated async handles; disabled by default", "overlap_metrics"),
-        Capability("gradient_bucket_overlap", CapabilityStatus.EXPERIMENTAL,
-                   "backward-ready buckets for non-FSDP reducers; FSDP combination is rejected", "overlap_metrics"),
         Capability("tp_bulk_overlap", CapabilityStatus.EXPERIMENTAL,
                    "pure PyTorch AG/RS bulk overlap with synchronous CPU/Gloo fallback", "tp"),
         Capability("parameter_prefetch", CapabilityStatus.EXPERIMENTAL,
@@ -111,8 +99,6 @@ def capability_matrix() -> tuple[Capability, ...]:
                    "bounded H2D/D2H scheduler with synchronous fallback", "offload"),
         Capability("tp_bulk_overlap_sequence_parallel", CapabilityStatus.EXPERIMENTAL,
                    "TP bulk overlap with explicit SP layout checks", "tp_bulk_overlap"),
-        Capability("gradient_bucket_overlap_accumulation", CapabilityStatus.EXPERIMENTAL,
-                   "accumulation-boundary gradient bucket scheduling", "gradient_bucket_overlap"),
         Capability("parameter_prefetch_dynamic_control_flow", CapabilityStatus.UNSUPPORTED,
                    "dynamic traces invalidate prefetch and use synchronous fetch", "offload_parameter"),
         Capability("pp_p2p_overlap_gpipe", CapabilityStatus.EXPERIMENTAL,
@@ -121,8 +107,6 @@ def capability_matrix() -> tuple[Capability, ...]:
                    "non-interleaved 1F1B steady-state P2P handle queue", "pp_p2p_overlap"),
         Capability("transfer_overlap_offload", CapabilityStatus.EXPERIMENTAL,
                    "parameter/activation/optimizer transfer scheduler", "transfer_overlap"),
-        Capability("microbatch_interleave", CapabilityStatus.EXPERIMENTAL,
-                   "two-microbatch TP interleave; PP/dynamic/offload combinations rejected", "tp_bulk_overlap"),
         Capability("planning_report", CapabilityStatus.STABLE,
                    "deterministic read-only topology/stage recommendations"),
         Capability("planning_apply", CapabilityStatus.EXPERIMENTAL,
@@ -130,7 +114,8 @@ def capability_matrix() -> tuple[Capability, ...]:
         Capability("fp8", CapabilityStatus.UNSUPPORTED,
                    "fp8 scaling, checkpoint and overflow handling are not implemented", "bf16"),
         Capability("compile", CapabilityStatus.UNSUPPORTED,
-                   "torch.compile integration is not implemented", "eager"),
+                   "torch.compile integration is not implemented",
+                   "single_process_eager"),
     )
 
 
@@ -154,10 +139,6 @@ def validate_combinations(config: FrameworkConfig, *, world_size: int = 1,
     if config.compile.enabled:
         raise UnsupportedCombinationError("compile.enabled=True is not implemented")
     overlap = config.overlap
-    if overlap.enable_gradient_bucket_overlap and config.fsdp.enabled:
-        raise UnsupportedCombinationError(
-            "overlap.enable_gradient_bucket_overlap cannot be combined with FSDP; use FSDP's reducer"
-        )
     if overlap.enable_optimizer_param_gather_overlap and config.fsdp.enabled:
         raise UnsupportedCombinationError(
             "optimizer parameter gather overlap is unsupported for FSDP without a public prefetch API"
@@ -166,14 +147,7 @@ def validate_combinations(config: FrameworkConfig, *, world_size: int = 1,
         raise UnsupportedCombinationError("overlap.enable_pp_p2p_overlap requires pp_size>1")
     if overlap.enable_tp_bulk_overlap and config.parallel.tp_size <= 1:
         raise UnsupportedCombinationError("overlap.enable_tp_bulk_overlap requires tp_size>1")
-    if overlap.enable_microbatch_interleave:
-        if config.parallel.tp_size <= 1:
-            raise UnsupportedCombinationError("microbatch interleave requires tp_size>1")
-        if config.parallel.pp_size > 1 or config.offload.activation:
-            raise UnsupportedCombinationError("microbatch interleave rejects PP and activation offload")
-    # CPU bfloat16 is legal for many operators, so it is deliberately NOT rejected
-    # globally.  (An earlier version ended with a branch that computed this and
-    # then returned without doing anything; removed rather than left as a decoy.)
+
 
 
 def validate_capabilities(config: FrameworkConfig, *, world_size: int = 1,

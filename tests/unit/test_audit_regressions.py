@@ -21,7 +21,6 @@ from aitrainer.data import model_inputs
 from aitrainer.diagnostics import dry_run
 from aitrainer.memory import PinnedBufferPool
 from aitrainer.offload.parameter import ParameterOffloader
-from aitrainer.overlap.gradient import GradientBucketReducer
 from aitrainer.planner import PlanCandidate, apply_candidate, suggest_plan
 
 
@@ -118,44 +117,6 @@ def test_apply_candidate_preserves_fields_it_does_not_name():
     updated.validate(world_size=8)
     # the input config must not be mutated
     assert config.parallel.dp_size == 2 and config.fsdp.mixed_precision.dtype == "float16"
-
-
-# --- gradient bucket reducer (reduced once per process lifetime) ------------
-
-class _FakeTensor:
-    def numel(self): return 8
-    def element_size(self): return 4
-
-
-def test_gradient_bucket_reducer_reduces_every_window():
-    calls: list[int] = []
-    reducer = GradientBucketReducer(1024, accumulation_steps=1,
-                                    reduce_fn=lambda values: calls.append(len(values)))
-    for _ in range(5):
-        reducer.register("w", _FakeTensor())
-        reducer.mark_microbatch_end()
-        reducer.finish_grad_sync()
-    assert len(calls) == 5
-    assert sum(len(bucket.tensors) for bucket in reducer.buckets) == 0
-
-
-def test_gradient_bucket_reducer_honours_accumulation_steps():
-    calls: list[int] = []
-    reducer = GradientBucketReducer(1024, accumulation_steps=4,
-                                    reduce_fn=lambda values: calls.append(len(values)))
-    for _ in range(12):
-        reducer.register("w", _FakeTensor())
-        reducer.mark_microbatch_end()
-        reducer.finish_grad_sync()
-    assert len(calls) == 3
-
-
-def test_gradient_bucket_reducer_refuses_to_flush_without_a_reducer():
-    """Flushing with reduce_fn=None cleared buckets and dropped gradients silently."""
-    reducer = GradientBucketReducer(1024, accumulation_steps=1)
-    reducer.register("w", _FakeTensor())
-    with pytest.raises(ValueError, match="reduce_fn"):
-        reducer.finish_grad_sync()
 
 
 # --- reproducibility and diagnostics ----------------------------------------
@@ -539,22 +500,6 @@ def test_released_without_completing_is_not_a_silent_success():
     assert done.wait() == 7                # a completed op still returns its value
 
 
-def test_eager_fallback_is_selected_and_not_registerable():
-    """attention_capability() reported backend='eager', which register() refuses."""
-    from aitrainer.kernels.attention import attention_capability, attention_kernel_backend
-    from aitrainer.kernels.backend import KernelBackend
-
-    capability = attention_capability()
-    assert attention_kernel_backend() is None          # no flash on a CPU box
-    assert capability.backend == "eager"
-
-    backend = KernelBackend("toy", eager=lambda value: value + 1)
-    with pytest.raises(ValueError, match="fallback"):
-        backend.register("eager", lambda value: value, capability)
-    selection = backend.select(device="cpu", dtype="float32")
-    assert selection.backend == "eager" and selection.used_fallback
-
-
 def test_overlap_peak_is_a_concurrency_high_water_mark():
     """inflight_peak reported the number of recorded operations, not a peak."""
     from aitrainer.core.lifecycle import AsyncOp
@@ -574,9 +519,16 @@ def test_overlap_peak_is_a_concurrency_high_water_mark():
     assert metrics.summary()["prefetch_hit"] == 5
 
 
-def test_rms_norm_stays_within_its_declared_error_budget():
-    """error_budget=0.0 was unattainable: bf16 rounds the product on its own."""
-    from aitrainer.kernels.backend import KernelBackend
+def test_rms_norm_stays_within_its_error_budget():
+    """The rms_norm reference implementation stays inside 2**-8 on reduced dtypes.
+
+    Both the bound and the implementation come from ``kernels/fused.py``, which
+    is now a reference implementation rather than the bottom of a backend
+    selection stack: ``KernelCapability.error_budget`` used to carry this number,
+    and that whole abstraction was deleted once it turned out to be a registry
+    with nothing to register and a fallback that PyTorch's dispatcher already
+    provides.
+    """
     from aitrainer.kernels.fused import rms_norm
 
     torch.manual_seed(0)
@@ -590,9 +542,6 @@ def test_rms_norm_stays_within_its_declared_error_budget():
         reference = exact * torch.rsqrt(exact.pow(2).mean(-1, keepdim=True) + 1e-6)
         relative = ((got.float() - reference).abs() / (reference.abs() + 1e-6)).max().item()
         assert relative <= 2 ** -8, f"{dtype}: {relative}"
-
-    fallback = KernelBackend("toy", eager=lambda value: value).select(device="cpu")
-    assert fallback.capability.error_budget > 0          # no longer an impossible 0.0
 
 
 def test_activation_unpack_is_repeatable_and_fails_loudly_after_drain():

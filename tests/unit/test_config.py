@@ -178,3 +178,20 @@ def test_every_config_field_is_read_somewhere():
         "changes nothing while still validating and serialising:\n  "
         + "\n  ".join(unread)
         + "\nDelete them (and any preset that sets them), or wire them up.")
+
+
+def test_capability_fallbacks_name_real_capabilities():
+    """A fallback pointing at nothing reads as guidance and is a dead end.
+
+    ``compile`` named ``"eager"``, which is not a capability in the matrix, so a
+    reader following it finds nothing -- while ``fp8`` correctly names ``bf16``.
+    Doubly worth checking around a deletion: removing capability entries can
+    strand the ones that pointed at them.
+    """
+    from aitrainer import capability_matrix
+
+    matrix = capability_matrix()
+    names = {item.name for item in matrix}
+    dangling = [(item.name, item.fallback) for item in matrix
+                if item.fallback is not None and item.fallback not in names]
+    assert not dangling, f"these capabilities fall back to unknown names: {dangling}"

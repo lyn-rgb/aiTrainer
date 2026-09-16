@@ -1,5 +1,5 @@
 from aitrainer.core.lifecycle import AsyncOp, AsyncState, ExecutionScheduler
-from aitrainer.overlap import Backpressure, GradientBucket, PingPongBuffer, ResourceBudget
+from aitrainer.overlap import Backpressure, PingPongBuffer, ResourceBudget
 
 
 def test_async_state_machine_and_idempotent_release():
@@ -29,8 +29,3 @@ def test_ping_pong_generation_and_budget():
     op = AsyncOp("budget").submit(); budget.admit(op); budget.drain()
 
 
-def test_bucket_boundary_does_not_drop_tensor():
-    bucket = GradientBucket("g", 4)
-    assert bucket.add(b"ab")
-    assert not bucket.add(b"abcd")
-    assert bucket.flush() == (b"ab",)
