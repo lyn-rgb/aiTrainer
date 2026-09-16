@@ -731,6 +731,77 @@ def _tp_group(world: int, rank: int):
     return ProcessGroups.create(mapping).tp_group
 
 
+@case("sharded_checkpoint_roundtrip")
+def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> dict:
+    """``Trainer.save_sharded`` / ``load_sharded`` at world_size > 1.
+
+    The opt-in DCP path, exercised end to end: train, save collectively, rebuild
+    from scratch, load, and compare parameters AND bookkeeping.  AdamW is used
+    rather than SGD so the optimizer genuinely has state to carry -- with plain
+    SGD ``get_optimizer_state_dict`` returns an empty state and the test would
+    pass while proving nothing about optimizer persistence.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.parallelizer import parallelize
+
+    path = Path(tempfile.gettempdir()) / f"aitrainer-sharded-{os.environ.get('MASTER_PORT', '0')}"
+    config = FrameworkConfig.from_dict({"parallel": {"dp_size": world}, "fsdp": {"enabled": True}})
+
+    def build():
+        # A FRESH module each time: `parallelize` FSDP-wraps in place, so reusing
+        # one object would wrap an already-wrapped model and the state-dict
+        # shapes would differ between save and load.
+        torch.manual_seed(7)
+        module = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 4))
+        runtime = Runtime(device="cpu", seed=7)
+        wrapped = parallelize(module, config=config, runtime=runtime)
+        optimizer = torch.optim.AdamW(wrapped.parameters(), lr=0.01)
+        trainer = Trainer(wrapped, optimizer, config=config, runtime=runtime)
+        return trainer
+
+    trainer = build()
+    batches = []
+    for index in range(3):
+        generator = torch.Generator().manual_seed(3000 + index)
+        batches.append((torch.randn(4, 8, generator=generator),
+                        torch.randint(0, 4, (4,), generator=generator)))
+    trainer.fit(batches, epochs=1)
+    before = [value for parameter in trainer.model.module.parameters()
+              for value in parameter.detach().flatten().tolist()]
+
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+    dist.barrier()
+    trainer.save_sharded(path)
+    dist.barrier()
+    written = sorted(item.name for item in path.iterdir())
+    shards = sorted(name for name in os.listdir(path / "dcp") if name.endswith(".distcp"))
+
+    trainer2 = build()
+    restored = trainer2.load_sharded(path)
+    after = [value for parameter in trainer2.model.module.parameters()
+             for value in parameter.detach().flatten().tolist()]
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+    # Measure the optimizer state itself, not the metadata blob it travels with.
+    # Zero entries would mean the checkpoint is not resumable.
+    optimizer_state_entries = sum(len(entry) for entry in trainer2.optimizer.state.values())
+    return {"rank": rank, "written": written, "shards": shards,
+            "global_step": restored["global_step"], "optimizer_step": restored["optimizer_step"],
+            "format": (restored["metadata"] or {}).get("format"),
+            "optimizer_state_entries": optimizer_state_entries,
+            "max_diff": max(abs(a - b) for a, b in zip(before, after))
+                        if len(before) == len(after) else float("inf")}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", required=True, choices=sorted(CASES))

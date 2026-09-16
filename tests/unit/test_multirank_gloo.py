@@ -331,3 +331,22 @@ def test_loading_a_foreign_coordinate_is_refused():
         assert payload["refused"] is True
         assert "would keep its random initialisation" in payload["message"]
         assert [0, 0, 1] not in payload["targets"]
+
+
+def test_sharded_checkpoint_roundtrip_at_two_ranks():
+    """The opt-in DCP path: ``save_sharded`` / ``load_sharded`` over two ranks.
+
+    AdamW rather than SGD in the worker, because plain SGD has no state and the
+    optimizer assertions below would pass while proving nothing.  The shard count
+    matters too: ``get_model_state_dict`` returns full-shaped tensors and DCP
+    splits them for storage, so "one file" would mean no sharding happened.
+    """
+    for payload in require_success(run_case("sharded_checkpoint_roundtrip", 2,
+                                            hard_timeout=180.0)):
+        assert payload["written"] == ["READY", "dcp", "metadata.json"]
+        assert payload["shards"] == ["__0_0.distcp", "__1_0.distcp"], "not sharded"
+        assert payload["format"] == "dcp-sharded"
+        assert payload["max_diff"] == 0.0, "restored parameters differ"
+        assert payload["global_step"] == 3 and payload["optimizer_step"] == 3
+        assert payload["optimizer_state_entries"] > 0, (
+            "the optimizer state did not survive; the checkpoint is not resumable")

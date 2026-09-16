@@ -162,6 +162,19 @@ class Trainer:
     def load_checkpoint(self, path: str | os.PathLike[str]) -> dict[str, Any]:
         return checkpointing.load_checkpoint(self, path)
 
+    def save_sharded(self, path: str | os.PathLike[str]) -> None:
+        """Write a DCP sharded checkpoint; every rank must pass the same path.
+
+        Separate from :meth:`save_checkpoint` on purpose -- the two formats are
+        not interchangeable, so the choice is an explicit call rather than a
+        behaviour that changes with configuration.
+        """
+        checkpointing.save_sharded(self, path)
+
+    def load_sharded(self, path: str | os.PathLike[str]) -> dict[str, Any]:
+        """Load a :meth:`save_sharded` checkpoint on every rank."""
+        return checkpointing.load_sharded(self, path)
+
     def close(self) -> None:
         self.overlap.drain(self.config.overlap.drain_timeout_s)
         self.offload.close(self.optimizer)
