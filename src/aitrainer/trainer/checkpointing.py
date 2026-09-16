@@ -35,6 +35,36 @@ def load_checkpoint(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any
     return state
 
 
+def _reject_unsupported_sharding(trainer: Any, operation: str) -> None:
+    """Refuse DCP checkpoints for models torch's helpers cannot interpret.
+
+    ``get_model_state_dict`` understands FSDP and DDP.  For anything else it
+    returns ``module.state_dict()`` -- the LOCAL tensor.  Under TP (or PP) those
+    differ per rank, and every rank writes its version under the same key, so DCP
+    keeps one and discards the rest; the load then hands that one to everybody.
+
+    Measured at world_size=2, tp=2: two ranks with genuinely different shards
+    both came back holding rank 1's values, max|dW| = 5.5e-01.  Silently
+    corrupting a model is far worse than refusing to save it, so this raises.
+    :func:`save_checkpoint` has no such restriction -- it writes each rank's own
+    file, which is exactly right for sharded parameters.
+    """
+    parallel = getattr(getattr(trainer, "config", None), "parallel", None)
+    for axis in ("tp_size", "pp_size"):
+        size = int(getattr(parallel, axis, 1) or 1)
+        if size > 1:
+            raise CheckpointError(
+                # The remedy first: an error message is read top-down, and the
+                # actionable half is worth nothing if it is on the line that gets
+                # truncated in a log.
+                f"{operation} does not support {axis}={size}; use "
+                "save_checkpoint/load_checkpoint instead, which writes a separate file "
+                "per rank. Reason: torch's distributed state-dict helpers treat a TP/PP "
+                "model's per-rank tensors as replicas, so every rank would save its local "
+                "shard under one key and the load would hand them all the same one."
+            )
+
+
 def _stateful_module(model: Any) -> Any:
     """The object torch's distributed state-dict helpers should be handed.
 
@@ -72,6 +102,7 @@ def save_sharded(trainer: Any, path: str | os.PathLike[str]) -> None:
         raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
     import torch
 
+    _reject_unsupported_sharding(trainer, "save_sharded")
     module = _stateful_module(trainer.model)
     trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
     trainer.offload.drain(trainer.optimizer)
@@ -104,6 +135,8 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
         raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
     import torch
 
+    _reject_unsupported_sharding(trainer, "save_sharded")
+    _reject_unsupported_sharding(trainer, "load_sharded")
     module = _stateful_module(trainer.model)
     trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
     trainer.offload.drain(trainer.optimizer)

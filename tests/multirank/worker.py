@@ -802,6 +802,60 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
                         if len(before) == len(after) else float("inf")}
 
 
+@case("sharded_checkpoint_refuses_tp")
+def sharded_checkpoint_refuses_tp(rank: int, world: int, dist, options: dict) -> dict:
+    """``save_sharded`` must refuse a TP model rather than corrupt it.
+
+    ``get_model_state_dict`` understands FSDP and DDP; for anything else it
+    returns ``module.state_dict()``, the LOCAL tensor.  Under TP those differ per
+    rank, every rank writes its version under the same key, DCP keeps one, and
+    the load hands that one to everyone.
+
+    Measured before the guard existed, at world_size=2/tp=2: two ranks with
+    genuinely different shards both came back holding rank 1's values,
+    max|dW| = 5.5e-01 -- and nothing reported a problem.
+
+    The check asserts the LOCAL shards really do differ first: if they matched,
+    the case would prove nothing about the guard.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, Trainer
+    from aitrainer.checkpoint import CheckpointError
+    from aitrainer.parallelizer import parallelize
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(8, 8)      # a declared column suffix
+            self.o_proj = torch.nn.Linear(8, 8)      # a declared row suffix
+        def forward(self, value):
+            return self.o_proj(torch.nn.functional.relu(self.q_proj(value)))
+
+    torch.manual_seed(7)
+    config = FrameworkConfig.from_dict({"parallel": {"tp_size": world}})
+    runtime = Runtime(device="cpu", seed=7)
+    model = parallelize(Block(), config=config, runtime=runtime)
+    trainer = Trainer(model, torch.optim.AdamW(model.parameters(), lr=0.01),
+                      config=config, runtime=runtime)
+
+    local = [value for parameter in model.parameters()
+             for value in parameter.detach().flatten().tolist()]
+    gathered: list = [None] * world
+    dist.all_gather_object(gathered, local)
+    shards_differ = any(gathered[0] != other for other in gathered[1:])
+    _require(shards_differ, "the local shards are identical; this case would prove nothing")
+
+    try:
+        trainer.save_sharded(f"/tmp/aitrainer-refuse-{rank}")
+    except CheckpointError as exc:
+        return {"rank": rank, "refused": True, "shards_differ": True,
+                "message": str(exc)[:200]}
+    raise AssertionError(
+        f"rank {rank}: save_sharded accepted a TP model; the load would hand every "
+        "rank the same shard")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", required=True, choices=sorted(CASES))

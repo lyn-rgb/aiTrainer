@@ -350,3 +350,24 @@ def test_sharded_checkpoint_roundtrip_at_two_ranks():
         assert payload["global_step"] == 3 and payload["optimizer_step"] == 3
         assert payload["optimizer_state_entries"] > 0, (
             "the optimizer state did not survive; the checkpoint is not resumable")
+
+
+def test_sharded_checkpoint_refuses_tp_models():
+    """``save_sharded`` must refuse rather than silently collapse TP shards.
+
+    This guards a defect that existed for exactly one commit.  ``get_model_state_dict``
+    understands FSDP and DDP; for a plain module it returns ``module.state_dict()``
+    -- the LOCAL tensor.  Under TP those differ per rank, every rank wrote its
+    version under the same key, DCP kept one, and the load handed that one to
+    everybody: measured at world_size=2/tp=2 as two ranks with different shards
+    both coming back with rank 1's, max|dW| = 5.5e-01.
+
+    The worker first gathers every rank's shard and asserts they are not all
+    equal, so this cannot pass vacuously on a model that was never sharded.
+    """
+    for payload in require_success(run_case("sharded_checkpoint_refuses_tp", 2,
+                                            hard_timeout=120.0)):
+        assert payload["shards_differ"] is True, "the fixture was not actually sharded"
+        assert payload["refused"] is True
+        assert "does not support tp_size=2" in payload["message"]
+        assert "save_checkpoint" in payload["message"], "the error must say what to use instead"
