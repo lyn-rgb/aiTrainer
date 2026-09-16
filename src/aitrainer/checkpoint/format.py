@@ -55,6 +55,12 @@ class Manifest:
     tensor_schema_hash: str = ""
     world_size_at_save: int = 1
     logical_sharding: dict[str, int] = field(default_factory=lambda: {"tp": 1, "pp": 1, "dp": 1})
+    # Whether the DP axis SPLIT tensors or only copied them.  DP replicas hold the
+    # whole model, so the default is a copy; under FSDP each replica holds a slice,
+    # and a checkpoint written for that layout must say so -- a file sharded along
+    # DP handed to a loader that expects copies leaves every rank with a fragment
+    # of a model and no error.
+    dp_sharded: bool = False
     tensors: dict[str, tuple[ShardSpec, ...]] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -92,6 +98,7 @@ class Manifest:
                    tensor_schema_hash=data.get("tensor_schema_hash", ""),
                    world_size_at_save=int(data.get("world_size_at_save", 1)),
                    logical_sharding=dict(data.get("logical_sharding", {"tp": 1, "pp": 1, "dp": 1})),
+                   dp_sharded=bool(data.get("dp_sharded", False)),
                    tensors=tensors)
 
 

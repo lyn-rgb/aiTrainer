@@ -117,3 +117,43 @@ def load_sharded(trainer: Any, path: str | os.PathLike[str]) -> dict[str, Any]:
     trainer.optimizer_step = int(state["bookkeeping"][1].item())
     return {"global_step": trainer.global_step, "optimizer_step": trainer.optimizer_step,
             "metadata": metadata}
+
+
+def load_pretrained(trainer: Any, path: str | os.PathLike[str], *,
+                    base_dir: str | os.PathLike[str] | None = None,
+                    map_location: Any = "cpu") -> dict[str, Any]:
+    """Load a converted pretrained checkpoint, each rank reading only its own shards.
+
+    The model must already be parallelised: ``load_for_rank`` writes into the
+    parameters the ranks actually hold, so under FSDP each rank reads its own
+    slice of each tensor and nothing is broadcast.  That is the whole point --
+    the alternative is one rank reading the complete model and shipping it out.
+
+    ``path`` is a manifest produced by ``CheckpointConverter.convert``.  Converting
+    a dense checkpoint is an offline step on purpose: reading a single-file
+    checkpoint means reading all of it, so it must not happen once per rank at
+    every startup.  Point ``convert(dp_sharded=...)`` at the layout the training
+    run will use.
+    """
+    from ..checkpoint import ModelLoader
+    from ..mesh import DeviceMeshManager
+
+    parallel = trainer.config.parallel
+    runtime = trainer.runtime
+    mesh = DeviceMeshManager(
+        pp_size=parallel.pp_size, dp_size=parallel.dp_size, tp_size=parallel.tp_size,
+        world_size=runtime.world_size,
+        device_type=str(runtime.state.device).split(":", 1)[0])
+    coordinate = mesh.coordinate
+    # FSDP shards the DP axis; without it the axis replicates and the checkpoint
+    # must hold copies.
+    dp_sharded = bool(trainer.config.fsdp.enabled and parallel.dp_size > 1)
+    module = _stateful_module(trainer.model)
+    trainer.overlap.drain(trainer.config.overlap.drain_timeout_s)
+    trainer.offload.drain(trainer.optimizer)
+    stats = ModelLoader().load_for_rank(
+        path, module.state_dict(),
+        pp_rank=coordinate.pp, tp_rank=coordinate.tp, dp_rank=coordinate.dp,
+        logical_sharding={"pp": parallel.pp_size, "tp": parallel.tp_size, "dp": parallel.dp_size},
+        dp_sharded=dp_sharded, base_dir=base_dir, map_location=map_location)
+    return stats

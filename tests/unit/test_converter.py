@@ -111,3 +111,38 @@ def test_convert_accepts_a_derived_stage_assignment(tmp_path):
             per_stage.setdefault(shard.target_rank[0], set()).add(name)
     assert per_stage[0] == {"q_proj.weight", "q_proj.bias"}, per_stage
     assert per_stage[1] == {"o_proj.weight", "o_proj.bias"}, per_stage
+
+
+def test_manifest_round_trip_keeps_every_field(tmp_path):
+    """A field added to Manifest but not to ``from_dict`` disappears SILENTLY.
+
+    This is not hypothetical: ``dp_sharded`` was added to the dataclass and to
+    ``to_dict`` (which uses ``asdict``) but not to ``from_dict``, which reads
+    fields one by one.  The manifest wrote it, read it back as the default
+    ``False``, and the loader then rejected a DP-sharded checkpoint as "converted
+    with dp_sharded=False" -- the field was right there in the JSON.
+
+    So this drives the round trip from ``dataclasses.fields`` rather than from a
+    hand-written list: a new field fails this test until it is serialized.
+    """
+    from dataclasses import fields
+
+    from aitrainer.checkpoint.format import Manifest, ShardSpec, load_manifest, write_manifest
+
+    shard = ShardSpec(tensor_name="w", global_shape=(4, 4), dtype="torch.float32",
+                      layout="tp_sharded", target_rank=(1, 1, 1), source_file="rank_00001.pt",
+                      source_key="w", source_offset=8, source_length=16, local_shape=(2, 4),
+                      global_offset=(2, 0), replicated=False, transform="transpose",
+                      checksum="deadbeef")
+    manifest = Manifest(format_version=1, model_config_hash="mch", tensor_schema_hash="tsh",
+                        world_size_at_save=8, logical_sharding={"tp": 2, "pp": 2, "dp": 2},
+                        dp_sharded=True, tensors={"w": (shard,)})
+    path = tmp_path / "manifest.json"
+    write_manifest(manifest, path)
+    restored = load_manifest(path)
+
+    for field in fields(Manifest):
+        assert getattr(restored, field.name) == getattr(manifest, field.name), (
+            f"Manifest.{field.name} did not survive the round trip -- "
+            "it is in the dataclass but not in from_dict")
+    assert restored.tensors["w"][0] == shard

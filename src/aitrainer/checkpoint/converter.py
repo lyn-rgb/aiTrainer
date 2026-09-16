@@ -22,15 +22,28 @@ class CheckpointConverter:
     """
 
     def __init__(self, *, partition_dims: Mapping[str, int | None] | None = None) -> None:
+        """``partition_dims`` says which tensors are split and along which axis.
+
+        Leave it empty and every tensor is recorded as replicated: the load is
+        still correct, but each rank reads the WHOLE model, so nothing is saved
+        over a broadcast.  Under tensor parallelism pass
+        ``plugins.transformer.TransformerTPPlan().partition_dims(model)`` -- it
+        mirrors what the torch styles actually split, and deriving it from the
+        plan keeps the checkpoint from disagreeing with the model about which
+        axis was cut.
+        """
         self.partition_dims = dict(partition_dims or {})
 
     def convert(self, source: str | Path, destination: str | Path, *, world_size: int | None = None,
                 dp_size: int = 1, tp_size: int = 1, pp_size: int = 1,
                 stage_assignment: Mapping[str, int] | None = None,
+                dp_sharded: bool = False,
                 model_config_hash: str = "", tensor_schema_hash: str = "") -> Manifest:
         for name, value in (("dp_size", dp_size), ("tp_size", tp_size), ("pp_size", pp_size)):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ConversionError(f"{name} must be a positive integer")
+        if dp_sharded and dp_size == 1:
+            raise ConversionError("dp_sharded=True requires dp_size>1")
         logical_world = dp_size * tp_size * pp_size
         if world_size is None:
             world_size = logical_world
@@ -93,10 +106,30 @@ class CheckpointConverter:
                     # A replicated tensor is copied to every stage only when no
                     # stage assignment is given; otherwise it belongs to one stage.
                     stages = range(pp_size) if not stage_assignment else (stage_of(name),)
+                    if dp_sharded:
+                        # FSDP shards EVERY parameter along dim 0, including the
+                        # ones TP replicates (a row projection's bias, a norm's
+                        # weight), so "replicated" stops being true once FSDP owns
+                        # the DP axis.
+                        if value.shape[0] % dp_size:
+                            raise ConversionError(
+                                f"tensor {name} dim0 {value.shape[0]} is not divisible by dp_size={dp_size}")
+                        dp_chunks = value.chunk(dp_size, dim=0)
                     for pp_rank in stages:
                         for dp_rank in range(dp_size):
                             for tp_rank in range(tp_size):
                                 rank = global_rank(pp_rank, dp_rank, tp_rank)
+                                if dp_sharded:
+                                    piece = dp_chunks[dp_rank].contiguous()
+                                    offset = [0] * value.ndim
+                                    offset[0] = dp_rank * piece.shape[0]
+                                    rank_payloads[rank][name] = piece
+                                    specs.append(ShardSpec(name, tuple(value.shape), str(value.dtype),
+                                                           "dp_sharded", target_rank=(pp_rank, tp_rank, dp_rank),
+                                                           source_file=f"rank_{rank:05d}.pt", source_key=name,
+                                                           local_shape=tuple(piece.shape),
+                                                           global_offset=tuple(offset)))
+                                    continue
                                 rank_payloads[rank][name] = value
                                 specs.append(ShardSpec(name, tuple(value.shape), str(value.dtype), "replicated",
                                                        target_rank=(pp_rank, tp_rank, dp_rank),
@@ -122,14 +155,28 @@ class CheckpointConverter:
                                            global_offset=tuple(offset)))
             else:
                 stage = stage_of(name)
-                for dp_rank in range(dp_size):
-                    for tp_rank in range(tp_size):
-                        chunk = chunks[tp_rank]
+                for tp_rank in range(tp_size):
+                    tp_chunk = chunks[tp_rank]
+                    if dp_sharded:
+                        # TP splits `dim`; FSDP always splits dim 0.  Applying both
+                        # to the same tensor gives the compound layout the ranks
+                        # actually hold.
+                        if tp_chunk.shape[0] % dp_size:
+                            raise ConversionError(
+                                f"tensor {name} dim0 {tp_chunk.shape[0]} is not divisible by dp_size={dp_size}")
+                        dp_chunks = tp_chunk.chunk(dp_size, dim=0)
+                    else:
+                        dp_chunks = (tp_chunk,) * dp_size
+                    for dp_rank in range(dp_size):
+                        chunk = dp_chunks[dp_rank]
                         rank = global_rank(stage, dp_rank, tp_rank)
                         rank_payloads[rank][name] = chunk.contiguous()
                         offset = [0] * value.ndim
-                        offset[dim] = tp_rank * chunk.shape[dim]
-                        specs.append(ShardSpec(name, tuple(value.shape), str(value.dtype), "tp_sharded",
+                        offset[dim] = tp_rank * tp_chunk.shape[dim]
+                        if dp_sharded:
+                            offset[0] += dp_rank * chunk.shape[0]
+                        specs.append(ShardSpec(name, tuple(value.shape), str(value.dtype),
+                                               "dp_sharded" if dp_sharded else "tp_sharded",
                                                target_rank=(stage, tp_rank, dp_rank),
                                                source_file=f"rank_{rank:05d}.pt", source_key=name,
                                                local_shape=tuple(chunk.shape),
@@ -150,6 +197,7 @@ class CheckpointConverter:
                             world_size_at_save=world_size,
                             logical_sharding={"tp": effective_tp if legacy_partition_world else tp_size,
                                               "pp": pp_size, "dp": dp_size},
+                            dp_sharded=dp_sharded,
                             tensors=tensor_specs)
         write_manifest(manifest, output / "manifest.json")
         return manifest

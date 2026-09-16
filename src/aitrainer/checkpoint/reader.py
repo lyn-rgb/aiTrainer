@@ -9,6 +9,53 @@ from ..core.tensors import tensor_bytes
 from .format import Manifest, ModelLoadConfig, file_checksum, load_manifest
 
 
+def _assign(target: Any, value: Any, *, tensor_name: str = "") -> None:
+    """Copy a shard read for this rank into ``target``, which may be sharded.
+
+    Two shapes are legitimate and they mean different things, so they must not be
+    guessed at:
+
+    * ``value`` has the target's LOCAL shape -- the checkpoint was written with
+      the same topology the model uses (the normal case: the converter was given
+      the TP plan's ``partition_dims`` and the same tp/dp sizes), so the shard is
+      exactly the parameter this rank holds.  Copy it.
+    * ``value`` has the target's GLOBAL shape -- the checkpoint was written
+      unpartitioned, so this rank read the whole tensor and has to cut its own
+      piece.  Let DTensor redistribute: hand-slicing cannot do it, because the
+      placements can be compound (``(_StridedShard(0, sf=2), Shard(0))`` for FSDP
+      over TP) and the split order is DTensor's business.
+
+    Anything else is a layout disagreement, and reporting it is the point.  A
+    checkpoint sharded for a different topology still produces a tensor of *some*
+    shape, so a silent ``redistribute`` would quietly cut the wrong thing.
+    """
+    import torch
+    placements = getattr(target, "placements", None)
+    if placements is None:
+        if tuple(value.shape) != tuple(target.shape):
+            raise ValueError(f"shape mismatch for {tensor_name}: source={tuple(value.shape)} "
+                             f"target={tuple(target.shape)}")
+        target.copy_(value)
+        return
+    local = target.to_local()
+    if tuple(value.shape) == tuple(local.shape):
+        with torch.no_grad():
+            local.copy_(value)
+        return
+    if tuple(value.shape) == tuple(target.shape):
+        from torch.distributed.tensor import DTensor, Replicate
+        whole = DTensor.from_local(value, target.device_mesh, [Replicate()])
+        piece = whole.redistribute(placements=placements).to_local()
+        with torch.no_grad():
+            local.copy_(piece)
+        return
+    raise ValueError(
+        f"shape mismatch for {tensor_name}: the shard read is {tuple(value.shape)}, but this "
+        f"rank's parameter is {tuple(local.shape)} locally and {tuple(target.shape)} in full. "
+        "The checkpoint's topology and this model's disagree -- re-convert it for this "
+        "layout (convert(..., dp_sharded=..., partition_dims=...))")
+
+
 class ModelLoader:
     def __init__(self, config: ModelLoadConfig | None = None) -> None:
         self.config = config or ModelLoadConfig()
@@ -72,6 +119,7 @@ class ModelLoader:
                       pp_rank: int = 0, tp_rank: int = 0, dp_rank: int = 0,
                       world_size: int | None = None,
                       logical_sharding: dict[str, int] | None = None,
+                      dp_sharded: bool | None = None,
                       base_dir: str | Path | None = None,
                       map_location: str | Any = "cpu") -> dict[str, int]:
         """Read only shards addressed to one logical rank and copy them into ``model``.
@@ -97,6 +145,17 @@ class ModelLoader:
         # Comparing only the world-size TOTAL accepted a tp=2,dp=1 checkpoint into
         # a tp=1,dp=2 layout: replicated tensors are shape-identical either way, so
         # nothing downstream noticed.  Callers that know their mesh can pin it.
+        # Whether the DP axis split or copied is a property of the FILE and of the
+        # LOADER, and they have to agree.  A checkpoint sharded along DP handed to
+        # a loader that expects copies gives every rank a fragment; a copied
+        # checkpoint handed to a loader expecting slices gives every rank a model
+        # it believes is 1/dp of something.  Neither raises downstream.
+        declared_dp_sharded = bool(getattr(manifest, "dp_sharded", False))
+        if dp_sharded is not None and bool(dp_sharded) != declared_dp_sharded:
+            raise ValueError(
+                f"checkpoint was converted with dp_sharded={declared_dp_sharded} but this "
+                f"loader asked for dp_sharded={bool(dp_sharded)}; a DP-sharded checkpoint "
+                "requires FSDP on the DP axis, and a copied one requires the opposite")
         if logical_sharding is not None:
             for axis in ("pp", "tp", "dp"):
                 declared = manifest.logical_sharding.get(axis)
@@ -155,10 +214,7 @@ class ModelLoader:
                     if shard.transform == "transpose":
                         value = value.transpose(-1, -2)
                     target = state[tensor_name]
-                    if tuple(value.shape) != tuple(target.shape):
-                        raise ValueError(f"shape mismatch for {tensor_name}: source={tuple(value.shape)} "
-                                         f"target={tuple(target.shape)}")
-                    target.copy_(value)
+                    _assign(target, value, tensor_name=tensor_name)
                     loaded += 1
                     bytes_read += tensor_bytes(value)
         return {"tensors_loaded": loaded, "bytes_read": bytes_read}

@@ -713,6 +713,53 @@ def test_sharded_checkpoint_reshards_to_a_single_process():
         "at least one tensor's shape differs between the dense and the sharded view")
 
 
+@pytest.mark.parametrize(("world", "options"), [
+    (2, {"dp": 2}),
+    (2, {"tp": 2}),
+    (2, {"pp": 2}),
+    (4, {"tp": 2, "dp": 2}),
+    (4, {"tp": 2, "pp": 2}),
+    (4, {"dp": 2, "pp": 2}),
+    (8, {"dp": 2, "tp": 2, "pp": 2}),
+], ids=["dp2", "tp2", "pp2", "tp2dp2", "tp2pp2", "dp2pp2", "dp2tp2pp2"])
+def test_pretrained_load_reads_only_this_ranks_shards(world, options):
+    """Pretrained loading must not be "rank 0 reads everything and broadcasts".
+
+    The weights arriving correctly is the easy half; the other half is *how*, and
+    it is invisible in the result -- a rank that reads the whole model and ships
+    it out produces identical parameters.  So this asserts the read volume, which
+    is the actual requirement: with a checkpoint converted for this topology each
+    rank reads its own slice, and the per-rank bytes fall as ``1/(dp*tp*pp)``.
+
+    It fails loudly on a topology mismatch rather than guessing: a checkpoint
+    sharded for a different layout still produces a tensor of *some* shape, so a
+    silent redistribute would cut the wrong thing.  ``_assign`` reports instead.
+
+    The total is slightly above the model size (1.06x at tp>1) because a row
+    projection's bias is genuinely replicated -- both ranks must read it.
+    """
+    payloads = require_success(run_case("load_pretrained_per_rank", world, options=options,
+                                        hard_timeout=300.0))
+    assert len(payloads) == world
+    dense = payloads[0]["dense_bytes"]
+    for payload in payloads:
+        assert payload["max_diff"] == 0.0, "the loaded weights differ from the reference"
+        assert 0 < payload["bytes_read"] < dense, (
+            f"rank {payload['rank']} read {payload['bytes_read']} bytes for a {dense}-byte "
+            "model -- it read everything, so nothing was saved over a broadcast")
+    total = sum(payload["bytes_read"] for payload in payloads)
+    # This is the assertion that catches "rank 0 reads everything and broadcasts":
+    # then every rank reads a whole model and the total is world_size * dense.
+    # A correctly partitioned checkpoint costs about one model in total, plus the
+    # tensors that really are replicated (a row projection's bias, which both
+    # ranks must read) -- which is why the bound is 1.15x and not 1.0x.  Per-rank
+    # reads are NOT asserted to be under dense/2 for the same reason: at tp=2 the
+    # replicated bias pushes one rank's total just above half.
+    assert total < dense * 1.15, (
+        f"the ranks together read {total} bytes for a {dense}-byte model; a correctly "
+        "partitioned checkpoint costs about one model, not one per rank")
+
+
 def test_pipeline_stages_keep_their_module_names():
     """The fix that lets pp and tp compose, pinned directly.
 

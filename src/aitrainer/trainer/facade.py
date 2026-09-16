@@ -181,6 +181,17 @@ class Trainer:
         """Load a :meth:`save_sharded` checkpoint on every rank."""
         return checkpointing.load_sharded(self, path)
 
+    def load_pretrained(self, path: str | os.PathLike[str], *,
+                        base_dir: str | os.PathLike[str] | None = None,
+                        map_location: Any = "cpu") -> dict[str, Any]:
+        """Load a converted pretrained checkpoint, each rank reading only its own shards.
+
+        The model must already be parallelised -- see ``trainer.checkpointing``
+        for why converting a dense checkpoint is a separate, offline step.
+        """
+        return checkpointing.load_pretrained(self, path, base_dir=base_dir,
+                                             map_location=map_location)
+
     def close(self) -> None:
         self.overlap.drain(self.config.overlap.drain_timeout_s)
         self.offload.close(self.optimizer)

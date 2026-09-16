@@ -1212,6 +1212,113 @@ def sharded_checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> 
                         if len(before) == len(after) else float("inf")}
 
 
+@case("load_pretrained_per_rank")
+def load_pretrained_per_rank(rank: int, world: int, dist, options: dict) -> dict:
+    """Load pretrained weights through the parallelised model, each rank reading its own.
+
+    The thing being checked is not just that the weights arrive -- it is *how*.
+    Every rank reads only the shards addressed to its own ``(pp, tp, dp)``
+    coordinate and writes them straight into the parameters it already holds, so
+    no rank ever reads a complete model and nothing is broadcast.  One rank
+    reading everything and shipping it out is the alternative this exists to
+    avoid, and it is invisible in the final weights -- which is why the worker
+    reports ``bytes_read`` per rank.
+
+    ``options`` carries ``dp``/``tp``/``pp``; the model is the four-unit block
+    used elsewhere so a split up to pp=4 is possible.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+    from torch import nn
+
+    from aitrainer import (
+        CheckpointConverter,
+        FrameworkConfig,
+        Runtime,
+        Trainer,
+        TransformerTPPlan,
+        stage_assignment,
+    )
+    from aitrainer.parallelizer import parallelize
+
+    dp = int(options.get("dp", 1))
+    tp = int(options.get("tp", 1))
+    pp = int(options.get("pp", 1))
+
+    class Unit(nn.Module):
+        def __init__(self, hidden: int) -> None:
+            super().__init__()
+            self.q_proj = nn.Linear(hidden, hidden)
+            self.o_proj = nn.Linear(hidden, hidden)
+
+        def forward(self, value):
+            return self.o_proj(torch.relu(self.q_proj(value)))
+
+    class Block(nn.Module):
+        def __init__(self, hidden: int = 8) -> None:
+            super().__init__()
+            self.unit0 = Unit(hidden)
+            self.unit1 = Unit(hidden)
+            self.unit2 = Unit(hidden)
+            self.unit3 = Unit(hidden)
+
+        def forward(self, value):
+            for unit in (self.unit0, self.unit1, self.unit2, self.unit3):
+                value = unit(value)
+            return value
+
+    path = Path(tempfile.gettempdir()) / f"aitrainer-pretrained-{os.environ.get('MASTER_PORT', '0')}"
+    # The "pretrained" weights every rank can reproduce independently, standing in
+    # for a dense checkpoint on shared storage.
+    torch.manual_seed(31337)
+    reference = Block()
+    dense = {name: value.detach().clone() for name, value in reference.state_dict().items()}
+
+    if rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True)
+        torch.save(reference.state_dict(), path / "dense.pt")
+        plan = TransformerTPPlan()
+        CheckpointConverter(partition_dims=plan.partition_dims(reference) if tp > 1 else None).convert(
+            path / "dense.pt", path / "sharded", pp_size=pp, dp_size=dp, tp_size=tp,
+            dp_sharded=dp > 1, stage_assignment=stage_assignment(reference, pp) if pp > 1 else None)
+    dist.barrier()
+
+    # A FRESH model: what it initialises to must be irrelevant once loaded.
+    torch.manual_seed(5)
+    config = FrameworkConfig.from_dict({
+        "parallel": {"dp_size": dp, "tp_size": tp, "pp_size": pp,
+                     "pp_schedule": "gpipe" if pp > 1 else "none",
+                     "num_microbatches": 2 if pp > 1 else 1},
+        "fsdp": {"enabled": dp > 1},
+    })
+    runtime = Runtime(device="cpu", init_process_group=False, seed=5)
+    model = parallelize(Block(), config=config, runtime=runtime)
+    trainer = Trainer(model, torch.optim.SGD(model.parameters(), lr=0.01),
+                      config=config, runtime=runtime,
+                      loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+    stats = trainer.load_pretrained(path / "sharded" / "manifest.json")
+
+    inner = trainer.model.module
+    module = inner.module if hasattr(inner, "stage_id") else inner
+    worst = 0.0
+    for name, parameter in module.named_parameters():
+        got = parameter.full_tensor() if hasattr(parameter, "full_tensor") else parameter
+        worst = max(worst, float((got.detach() - dense[name]).abs().max()))
+    gathered = [None] * world
+    dist.all_gather_object(gathered, {"rank": rank, "bytes": stats["bytes_read"],
+                                      "tensors": stats["tensors_loaded"], "stage": getattr(inner, "stage_id", 0)})
+    dist.barrier()
+    return {"rank": rank, "stage": getattr(inner, "stage_id", 0),
+            "max_diff": worst, "bytes_read": stats["bytes_read"],
+            "tensors_loaded": stats["tensors_loaded"],
+            "all_ranks": gathered if rank == 0 else None,
+            "dense_bytes": sum(v.numel() * v.element_size() for v in dense.values())}
+
+
 @case("composition_train_matches_dense")
 def composition_train_matches_dense(rank: int, world: int, dist, options: dict) -> dict:
     """Train through ``Trainer.fit`` on every axis at once, against a dense reference.

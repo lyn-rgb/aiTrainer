@@ -61,3 +61,34 @@ class TransformerTPPlan:
                 raise ValueError(f"{name}.out_features={child.out_features} is not divisible by tp_size={tp_size}")
             if role == "row" and child.in_features % tp_size:
                 raise ValueError(f"{name}.in_features={child.in_features} is not divisible by tp_size={tp_size}")
+
+    def partition_dims(self, module: Any) -> dict[str, int]:
+        """``{parameter name: dimension}`` for the tensors tensor parallelism splits.
+
+        ``CheckpointConverter.convert`` needs this to write a genuinely sharded
+        checkpoint; without it every tensor is treated as replicated, every rank
+        reads the whole model, and the load is correct but saves no IO at all --
+        measured at tp=2 as ``bytes_read`` equal to the full model on both ranks.
+
+        It mirrors what torch's styles actually do (read from
+        ``torch.distributed.tensor.parallel.style``): a column projection shards
+        its weight *and* bias on dim 0, a row projection shards its weight on
+        dim 1 and **replicates** its bias.  Deriving it from the plan rather than
+        asking the caller keeps the checkpoint and the model from disagreeing
+        about which axis was split.
+        """
+        import torch
+        dims: dict[str, int] = {}
+        for name, child in module.named_modules():
+            if not name or not isinstance(child, torch.nn.Linear):
+                continue
+            role = self.role(name)
+            if role == "column":
+                dims[f"{name}.weight"] = 0
+                if child.bias is not None:
+                    dims[f"{name}.bias"] = 0
+            elif role == "row":
+                dims[f"{name}.weight"] = 1
+                # A row projection's bias is Replicate: splitting it would leave
+                # each rank adding a fraction of the bias.
+        return dims
