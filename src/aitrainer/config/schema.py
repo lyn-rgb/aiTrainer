@@ -46,24 +46,27 @@ class ParallelConfig:
 
 @dataclass(frozen=True)
 class PrecisionConfig:
-    """Per-tensor-class dtypes.
+    """Per-tensor-class dtypes, each one consumed by the trainer.
 
-    ``compute_dtype``, ``grad_dtype`` and ``optimizer_dtype`` are consumed by the
-    trainer.  ``reduce_dtype`` is threaded into the TP row projections.
-
-    Parameter *storage* dtype is controlled by ``FSDPConfig.mixed_precision.dtype``;
-    there is deliberately no ``param_dtype`` here, because one used to exist with no
-    consumer at all and silently did nothing when set.
+    Parameter *storage* dtype is controlled by ``FSDPConfig.mixed_precision.dtype``,
+    and so is the reduction dtype FSDP uses: FSDP2 sets both from that one field.
+    There is deliberately neither a ``param_dtype`` nor a ``reduce_dtype`` here.
+    Each used to exist with no consumer at all and silently did nothing when set,
+    and each was deleted for that reason.  ``reduce_dtype`` was the subtler of the
+    two: it genuinely reached ``RowParallelLinear``'s reduction before the
+    DTensor migration, so it looked wired for several rounds after that
+    migration had dropped the connection on the floor -- the field, its
+    validation, two presets that set it and a docstring claiming the wiring all
+    survived the code that did the work.
     """
 
     compute_dtype: Any = "float32"
     grad_dtype: Any = "float32"
-    reduce_dtype: Any = "float32"
     optimizer_dtype: Any = "float32"
     use_grad_scaler: bool | None = None
 
     def validate(self) -> None:
-        names = ("compute_dtype", "grad_dtype", "reduce_dtype", "optimizer_dtype")
+        names = ("compute_dtype", "grad_dtype", "optimizer_dtype")
         allowed = {"float32", "float16", "bfloat16"}
         for name in names:
             value = getattr(self, name)
@@ -184,7 +187,6 @@ class AdvancedOverlapConfig:
     """
     enable_tp_bulk_overlap: bool = False
     enable_gradient_bucket_overlap: bool = False
-    enable_parameter_prefetch: bool = False
     enable_optimizer_param_gather_overlap: bool = False
     enable_pp_p2p_overlap: bool = False
     enable_transfer_overlap: bool = False
@@ -196,7 +198,7 @@ class AdvancedOverlapConfig:
     drain_timeout_s: float = 60.0
 
     def validate(self) -> None:
-        for name in ("enable_tp_bulk_overlap", "enable_gradient_bucket_overlap", "enable_parameter_prefetch",
+        for name in ("enable_tp_bulk_overlap", "enable_gradient_bucket_overlap",
                      "enable_optimizer_param_gather_overlap", "enable_pp_p2p_overlap", "enable_transfer_overlap",
                      "enable_microbatch_interleave"):
             if not isinstance(getattr(self, name), bool):

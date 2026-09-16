@@ -10,7 +10,6 @@
   "precision": {
     "compute_dtype": "bfloat16",
     "grad_dtype": "float32",
-    "reduce_dtype": "float32",
     "optimizer_dtype": "float32"
   },
   "fsdp": {

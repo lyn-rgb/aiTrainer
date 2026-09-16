@@ -113,3 +113,68 @@ def test_fsdp_requires_a_process_group():
 
     with pytest.raises(FSDPConfigurationError, match="process group"):
         wrap_fsdp(torch.nn.Linear(3, 2), runtime=_Runtime(), mesh=None, config=None)
+
+
+def test_every_config_field_is_read_somewhere():
+    """A config field with no reader is a lie the whole system keeps telling.
+
+    It validates, it serialises into `to_dict()`, it shows up in the CLI's
+    `dry-run` output and in checkpoint metadata -- so it looks live from every
+    angle a user can see, while changing it alters nothing.  That is the worst
+    shape of defect this project has: silent, and self-concealing.
+
+    It has happened at least seven times: `PrecisionConfig.param_dtype`,
+    `PrecisionConfig.reduce_dtype`, `FSDPConfig.sharding` / `limit_all_gathers` /
+    `forward_prefetch` / `execution_trace_complete`, `CompileConfig.mode` /
+    `fullgraph` / `dynamic`, and `OverlapConfig.enable_parameter_prefetch`.
+
+    `reduce_dtype` is the one that shows why reading the code is not enough.  It
+    was genuinely wired, to `RowParallelLinear`'s reduction, and then the DTensor
+    migration deleted that layer and replaced it with a `RowwiseParallel` style
+    (which takes no dtype).  The field, its validation, the two presets that set
+    it and a docstring asserting "threaded into the TP row projections" all
+    survived the code that did the work.  `test_precision` could not see any of
+    it: nothing fails when a field stops being read.
+
+    A reader is a `.field` access or a `getattr(obj, "field")` outside
+    `schema.py`.  Validation does NOT count -- a field's own type check is
+    precisely what a dead field has left.
+    """
+    import ast
+    from dataclasses import fields, is_dataclass
+    from pathlib import Path
+
+    from aitrainer.config import schema as schema_module
+
+    def leaf_names(obj, prefix=""):
+        if is_dataclass(obj):
+            names = []
+            for field_ in fields(obj):
+                names.extend(leaf_names(getattr(obj, field_.name, None),
+                                        f"{prefix}{field_.name}."))
+            return names
+        return [prefix.rstrip(".")]
+
+    leaves = leaf_names(FrameworkConfig())
+    field_names = {leaf.split(".")[-1]: leaf for leaf in leaves}
+
+    root = Path(schema_module.__file__).resolve().parents[1]
+    readers = {name: [] for name in field_names}
+    for path in sorted(root.rglob("*.py")):
+        if path.resolve() == Path(schema_module.__file__).resolve():
+            continue
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if isinstance(node, ast.Attribute) and node.attr in field_names:
+                readers[node.attr].append(f"{path.relative_to(root)}:{node.lineno}")
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id == "getattr" and len(node.args) >= 2
+                  and isinstance(node.args[1], ast.Constant)
+                  and node.args[1].value in field_names):
+                readers[node.args[1].value].append(f"{path.relative_to(root)}:{node.lineno}")
+
+    unread = sorted(field_names[name] for name, sites in readers.items() if not sites)
+    assert not unread, (
+        "these config fields are read by nothing outside schema.py, so setting them "
+        "changes nothing while still validating and serialising:\n  "
+        + "\n  ".join(unread)
+        + "\nDelete them (and any preset that sets them), or wire them up.")

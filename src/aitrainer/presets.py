@@ -41,7 +41,7 @@ class ConfigPreset:
         """
         return FrameworkConfig(precision=PrecisionConfig(
             compute_dtype="bfloat16", grad_dtype="float32",
-            reduce_dtype="bfloat16", optimizer_dtype="bfloat16"))
+            optimizer_dtype="bfloat16"))
 
     @staticmethod
     def performance() -> FrameworkConfig:
@@ -53,4 +53,4 @@ class ConfigPreset:
         """
         return FrameworkConfig(precision=PrecisionConfig(
             compute_dtype="bfloat16", grad_dtype="float32",
-            reduce_dtype="bfloat16", optimizer_dtype="float32"))
+            optimizer_dtype="float32"))
