@@ -72,7 +72,8 @@ def test_group_creation_order_is_load_bearing():
     lists at the same store index, and no rank observes the expected barrier.
     """
     results = run_case("groups_legacy_order_deadlocks", 4, shape="2,2,1",
-                       timeout_seconds=3.0, hard_timeout=10.0)
+                       timeout_seconds=3.0, hard_timeout=10.0,
+                       retry_on_rendezvous=False)
     assert not all(result.returncode == 0 for result in results), (
         "the removed ordering completed cleanly, so the canonical ordering fix "
         "is not what makes group creation terminate")
@@ -222,3 +223,50 @@ def test_pipeline_accumulation_drops_the_trailing_window():
         assert payload["applied"] == reference["applied"]
     joined = replicas[0]["parameters"] + replicas[1]["parameters"]
     assert joined == reference["parameters"], "accumulated pipeline weights diverged"
+
+
+@pytest.mark.parametrize("mode", ["fsdp", "tp"])
+def test_checkpoint_roundtrip_at_two_ranks(mode):
+    """Save, rebuild from scratch, load, and compare -- through the real trainer.
+
+    The persistence path had zero multi-rank coverage: every checkpoint test was
+    single-process.  It is per-rank by design (each rank writes its own complete
+    ``rank_state.pt``, and ``CheckpointManager.save`` issues no collective), so
+    the things that can only break here are per-rank file writing and
+    ``load_state_dict`` under a live process group.
+    """
+    replicas = require_success(run_case("checkpoint_roundtrip", 2, options={"mode": mode},
+                                        hard_timeout=180.0))
+    assert len(replicas) == 2
+    for payload in replicas:
+        assert payload["written"] == ["READY", "checksums.json", "metadata.json", "rank_state.pt"]
+        assert payload["max_diff"] == 0.0, "restored parameters differ from the trained ones"
+        assert payload["global_step"] == 1
+        assert payload["optimizer_step"] == 1
+
+
+def test_dcp_save_keeps_every_rank_shard():
+    """A collective save must not let one rank's publish delete the others'.
+
+    ``dcp.save`` is collective: each rank contributes a different shard and the
+    coordinator writes ``.metadata``, all into one directory.  ``save_dcp`` used
+    to stage in a per-process ``mkdtemp`` and then let EVERY rank ``_publish``
+    over the shared target, so the last rank to finish replaced the directory the
+    others had just written into.  Measured at world_size=2 before the fix: the
+    target held only ``['__1_0.distcp']``, with rank 0's shard and ``.metadata``
+    gone, and the load failed.
+
+    Asserting the shard count is what makes this a regression test rather than a
+    smoke test -- a one-shard directory still "saves successfully".
+    """
+    reference = require_success(run_case("checkpoint_dcp_roundtrip", 1,
+                                         hard_timeout=180.0))[0]
+    assert reference["shards"] == ["__0_0.distcp"]
+    assert reference["max_diff"] == 0.0
+
+    replicas = require_success(run_case("checkpoint_dcp_roundtrip", 2, hard_timeout=180.0))
+    for payload in replicas:
+        assert payload["shards"] == ["__0_0.distcp", "__1_0.distcp"], (
+            "a shard or the .metadata file was destroyed by another rank's publish")
+        assert payload["metadata"]["world"] == 2
+        assert payload["max_diff"] == 0.0, "DCP round-trip did not restore the tensor"

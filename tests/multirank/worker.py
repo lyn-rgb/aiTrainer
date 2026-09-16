@@ -428,6 +428,134 @@ def _classification_batch(step: int):
 
 
 # --------------------------------------------------------------------------- #
+# Checkpointing -- the persistence path, at world_size > 1
+# --------------------------------------------------------------------------- #
+def _checkpoint_model(world: int, options: dict):
+    """The model the checkpoint cases train, in whichever sharding they ask for."""
+    import torch
+    from torch import nn
+
+    from aitrainer import FrameworkConfig, Runtime
+    from aitrainer.parallelizer import parallelize
+
+    torch.manual_seed(7)
+    module = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+    mode = options.get("mode", "fsdp")
+    values: dict = {"grad_accumulation_steps": 1}
+    if world > 1:
+        if mode == "fsdp":
+            values["parallel"] = {"dp_size": world}
+            values["fsdp"] = {"enabled": True}
+        elif mode == "tp":
+            values["parallel"] = {"tp_size": world}
+        else:
+            raise ValueError(f"unknown checkpoint case mode {mode!r}")
+    config = FrameworkConfig.from_dict(values)
+    runtime = Runtime(device="cpu", seed=7)
+    model = parallelize(module, config=config, runtime=runtime) if world > 1 else module
+    return config, runtime, model
+
+
+def _flatten(model) -> list:
+    return [value for parameter in model.parameters()
+            for value in parameter.detach().flatten().tolist()]
+
+
+@case("checkpoint_roundtrip")
+def checkpoint_roundtrip(rank: int, world: int, dist, options: dict) -> dict:
+    """Save through the production path, rebuild, load, and compare.
+
+    The persistence path had **zero** multi-rank coverage: every checkpoint test
+    was single-process, and nothing under ``tests/multirank/`` touched it.  That
+    matters more than usual here because the design is per-rank: each rank writes
+    its own complete ``rank_state.pt``, so correctness depends on every rank
+    doing so and on ``load_state_dict`` behaving under a real process group.
+
+    Each rank writes to its own path -- ``CheckpointManager.save`` issues no
+    collective, so a shared path would have the ranks race over one directory.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer import Trainer
+
+    config, runtime, model = _checkpoint_model(world, options)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    # No loss_fn: `_classification_batch` carries int labels, which the shared
+    # loss policy's tuple branch reduces with cross-entropy.
+    trainer = Trainer(model, optimizer, config=config, runtime=runtime)
+    trainer.fit([_classification_batch(0)], epochs=1)
+    trained = _flatten(trainer.model.module)
+
+    directory = Path(tempfile.mkdtemp(prefix=f"ckpt-{rank}-"))
+    path = directory / "step"
+    try:
+        trainer.save_checkpoint(path)
+        written = sorted(item.name for item in path.iterdir())
+
+        # Rebuild from scratch and load; the fresh model must end up trained.
+        _, runtime2, model2 = _checkpoint_model(world, options)
+        optimizer2 = torch.optim.SGD(model2.parameters(), lr=0.1)
+        trainer2 = Trainer(model2, optimizer2, config=config, runtime=runtime2)
+        trainer2.load_checkpoint(path)
+        restored = _flatten(trainer2.model.module)
+        return {"rank": rank, "written": written, "trained": trained,
+                "restored": restored, "global_step": trainer2.global_step,
+                "optimizer_step": trainer2.optimizer_step,
+                "max_diff": max(abs(a - b) for a, b in zip(trained, restored))
+                            if len(trained) == len(restored) else float("inf")}
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@case("checkpoint_dcp_roundtrip")
+def checkpoint_dcp_roundtrip(rank: int, world: int, dist, options: dict) -> dict:
+    """The genuinely sharded path, at world_size > 1.
+
+    ``save_dcp``/``load_dcp`` wrap ``torch.distributed.checkpoint``, which really
+    does split the state across ranks (each writes its own ``__N_M.distcp``
+    shard).  Unlike the per-rank path above, DCP *is* collective, so every rank
+    uses the SAME path -- that difference is the point of covering both.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import torch
+
+    from aitrainer.checkpoint import CheckpointManager
+
+    torch.manual_seed(11)
+    original = torch.randn(8, 4)
+    # ONE directory for the whole job -- `dcp.save` is collective and each rank
+    # writes a different shard into it.  Keyed on MASTER_PORT so concurrent jobs
+    # do not share one, and identical on every rank of this job.
+    directory = Path(tempfile.gettempdir()) / f"aitrainer-dcp-{os.environ.get('MASTER_PORT', '0')}"
+    path = directory / "step"
+    if rank == 0:
+        shutil.rmtree(directory, ignore_errors=True)
+    dist.barrier()
+    try:
+        CheckpointManager().save_dcp(path, state={"w": original.clone()},
+                                     metadata={"world": world})
+        shards = sorted(name for name in os.listdir(path / "dcp") if name.endswith(".distcp"))
+
+        restored = {"w": torch.zeros_like(original)}
+        metadata = CheckpointManager().load_dcp(path, state=restored)
+        return {"rank": rank, "shards": shards, "metadata": metadata,
+                "max_diff": float((restored["w"] - original).abs().max().item()),
+                "shape": list(restored["w"].shape)}
+    finally:
+        dist.barrier()
+        if rank == 0:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 def _tp_group(world: int, rank: int):
     from aitrainer.parallel.groups import ProcessGroups
     from aitrainer.topology import RankMapping

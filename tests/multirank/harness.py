@@ -95,16 +95,22 @@ def _parse(stdout: str) -> dict | None:
 def run_case(case: str, world_size: int, *, shape: str | None = None,
              options: dict[str, str] | None = None,
              timeout_seconds: float = 30.0,
-             hard_timeout: float = 120.0) -> list[RankResult]:
+             hard_timeout: float = 120.0,
+             retry_on_rendezvous: bool = True) -> list[RankResult]:
     """Run ``case`` on ``world_size`` processes and return every rank's result.
 
     A rendezvous that never came up is retried once, because a transient port
     collision would otherwise surface as a red gate that passes on re-run.
-    Cases that *expect* a timeout are unaffected -- see ``_RENDEZVOUS_FAILURES``.
+
+    Pass ``retry_on_rendezvous=False`` for a case whose EXPECTED outcome is a
+    failure.  Retrying there is not just wasted time: it replaces the failure the
+    test is looking for with a different one.  The deadlock control below asserts
+    a store-barrier timeout, and a retry that happened to die in rendezvous
+    instead left it with no store-barrier evidence at all -- a flake.
     """
     results = _run_once(case, world_size, shape=shape, options=options,
                         timeout_seconds=timeout_seconds, hard_timeout=hard_timeout)
-    if _rendezvous_failed(results):
+    if retry_on_rendezvous and _rendezvous_failed(results):
         results = _run_once(case, world_size, shape=shape, options=options,
                             timeout_seconds=timeout_seconds, hard_timeout=hard_timeout)
     return results

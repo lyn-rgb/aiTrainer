@@ -85,9 +85,24 @@ class CheckpointManager:
         self.allow_world_size_change = allow_world_size_change
 
     def _runtime_values(self) -> tuple[int, int, str | None, int]:
+        """Rank and world size, from the Runtime if given, else from the process group.
+
+        Falling back to ``torch.distributed`` matters: a manager constructed
+        without a runtime used to report rank 0 / world size 1 even inside a
+        two-rank job, which wrote wrong metadata into every checkpoint and made
+        any decision that depends on "am I rank 0" wrong on every rank.
+        """
         state = getattr(self.runtime, "state", None)
-        return (int(getattr(state, "rank", 0)), int(getattr(state, "world_size", 1)),
-                getattr(state, "backend", None), int(getattr(state, "local_rank", 0)))
+        if state is not None:
+            return (int(getattr(state, "rank", 0)), int(getattr(state, "world_size", 1)),
+                    getattr(state, "backend", None), int(getattr(state, "local_rank", 0)))
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return (0, 1, None, 0)
+        if dist.is_available() and dist.is_initialized():
+            return (int(dist.get_rank()), int(dist.get_world_size()), dist.get_backend(), 0)
+        return (0, 1, None, 0)
 
     def save(self, path: str | Path, *, model: Any, optimizer: Any,
              scheduler: Any = None, scaler: Any = None, global_step: int = 0,
@@ -205,25 +220,57 @@ class CheckpointManager:
                 "optimizer_step": int(payload.get("optimizer_step", payload["global_step"])),
                 "sampler_state": payload.get("sampler_state", {}), "metadata": metadata}
 
+    def _barrier(self) -> None:
+        """Synchronise every rank, when there is more than one."""
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
     def save_dcp(self, path: str | Path, *, state: Mapping[str, Any], metadata: Mapping[str, Any] | None = None) -> Path:
-        """Atomically publish a torch.distributed.checkpoint directory."""
+        """Atomically publish a torch.distributed.checkpoint directory.
+
+        ``dcp.save`` is COLLECTIVE: every rank writes a different shard, and the
+        coordinator additionally writes ``.metadata``, all into one directory.
+        This used to give each rank its own ``mkdtemp`` staging directory and
+        then let every rank ``_publish`` it over the shared target -- so the last
+        rank to finish replaced the directory the others had just written into.
+
+        Measured at world_size=2: the target ended up holding only
+        ``['__1_0.distcp']``, with rank 0's shard and the ``.metadata`` file gone,
+        and ``load_dcp`` then failed with ``assert metadata is not None``.  The
+        single-process tests could never see it, and ``save_dcp`` had no caller in
+        ``src/`` at all.
+
+        Now all ranks stage into ONE shared directory (a fixed name, not a
+        per-process one), and rank 0 publishes it after a barrier.
+        """
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
+        rank, _world_size, _backend, _ = self._runtime_values()
+        staging = target.with_name(f".{target.name}.tmp-staging")
         try:
-            try:
-                import torch.distributed.checkpoint as dcp
-            except ImportError as exc:
-                raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
-            dcp.save(dict(state), storage_writer=dcp.FileSystemWriter(str(temporary / "dcp")))
-            meta_path = temporary / "metadata.json"
-            meta_path.write_text(json.dumps(dict(metadata or {}), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            (temporary / "READY").write_text("complete\n", encoding="utf-8")
-            self._publish(temporary, target)
+            import torch.distributed.checkpoint as dcp
+        except ImportError as exc:
+            raise CheckpointError("torch.distributed.checkpoint is unavailable") from exc
+        try:
+            if rank == 0 and staging.exists():
+                _remove_path(staging)
+            self._barrier()
+            dcp.save(dict(state), storage_writer=dcp.FileSystemWriter(str(staging / "dcp")))
+            self._barrier()
+            if rank == 0:
+                (staging / "metadata.json").write_text(
+                    json.dumps(dict(metadata or {}), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                (staging / "READY").write_text("complete\n", encoding="utf-8")
+                self._publish(staging, target)
+            self._barrier()
             return target
         except Exception:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+            if rank == 0 and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
             raise
 
     def load_dcp(self, path: str | Path, *, state: dict[str, Any]) -> dict[str, Any]:
