@@ -7,7 +7,11 @@ from typing import Any
 from .capability import validate_capabilities
 from .config import FrameworkConfig
 from .parallel.fsdp import wrap_fsdp
-from .parallel.tp import parallelize_tensor_parallel, sequence_parallel_styles
+from .parallel.tp import (
+    parallelize_tensor_parallel,
+    require_sequence_parallel_targets,
+    sequence_parallel_styles,
+)
 from .mesh import DeviceMeshManager
 from .plugins.transformer import TransformerTPPlan
 from .parallel.pp_shapes import split_sequential
@@ -66,6 +70,12 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
     # meaning 'megatron'; the Ulysses head exchange is `UlyssesAttention`, an
     # explicit API call, because it needs NCCL.
     sequence_parallel = config.parallel.sp_backend != "none"
+    if sequence_parallel:
+        # Before the stage split, deliberately: under PP a stage may legitimately
+        # hold no norm, so the question "can this model use SP at all" has to be
+        # asked of the whole model or a valid split gets refused.  See
+        # require_sequence_parallel_targets for the measured case.
+        require_sequence_parallel_targets(model)
     if config.parallel.tp_size > 1 or sequence_parallel:
         plan = tp_plan or TransformerTPPlan()
         styles = plan.styles(stage)

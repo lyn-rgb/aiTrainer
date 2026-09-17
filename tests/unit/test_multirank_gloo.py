@@ -230,6 +230,25 @@ def test_sequence_parallel_matches_dense():
             "style that shards nothing would still match the dense numbers exactly")
 
 
+def test_sequence_parallel_refuses_at_world_two_without_a_layernorm():
+    """The refusal has to reach the real call path, at every rank.
+
+    The unit test in ``test_sp_single`` checks the guard function; this checks
+    that ``parallelize`` actually calls it, and that the model the guard rejects
+    is rejected on BOTH ranks rather than on the one that happened to look
+    first -- a refusal that is not rank-consistent is a hang, not an error.
+    """
+    for payload in require_success(run_case("sequence_parallel_refuses_without_layernorm", 2,
+                                            hard_timeout=120.0)):
+        assert payload["refused"] is True
+        assert "no torch.nn.LayerNorm" in payload["message"], (
+            f"refused for the wrong reason: {payload['message']}")
+        # And the same block with a LayerNorm is still sharded, so the guard is
+        # about the norm type and not about refusing SP in general.
+        assert payload["accepted_norm_weight_type"] == "DTensor"
+        assert "Replicate" in payload["accepted_norm_placements"]
+
+
 def test_variable_length_ulysses_refuses_at_world_two():
     """§4.10 d: the path whose mask is wrong must refuse, not approximate."""
     for payload in require_success(run_case("ulysses_seq_lens_refuses", 2, hard_timeout=60.0)):

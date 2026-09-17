@@ -449,6 +449,67 @@ def ulysses_attention_equivalence(rank: int, world: int, dist, options: dict) ->
     return {"rank": rank, "error": _max_abs_diff(out, dense)}
 
 
+@case("sequence_parallel_refuses_without_layernorm")
+def sequence_parallel_refuses_without_layernorm(rank: int, world: int, dist, options: dict) -> dict:
+    """SP over a model whose norms it cannot shard must refuse at every rank.
+
+    Measured before the guard existed: ``tp_size=2`` with
+    ``sp_backend='megatron'`` over a model using ``nn.RMSNorm`` raised nothing
+    and left every norm's weight a plain ``Parameter`` -- sequence parallelism
+    configured, reported, and absent.  The TP plan matched the projections, so
+    the neighbouring "names no module to shard" guard had no reason to fire,
+    which is exactly why this case has to keep the projections nameable: remove
+    them and TP refuses first, and the test would pass for the wrong reason.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, parallelize
+    from aitrainer.parallel.tp import TPConfigurationError
+
+    class RMSNorm(torch.nn.Module):
+        def __init__(self, dim: int) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(dim))
+
+        def forward(self, value):
+            return value / value.norm(dim=-1, keepdim=True).clamp(min=1e-6) * self.weight
+
+    class Block(torch.nn.Module):
+        def __init__(self, norm) -> None:
+            super().__init__()
+            self.norm = norm
+            self.q_proj = torch.nn.Linear(8, 8)
+            self.o_proj = torch.nn.Linear(8, 8)
+
+        def forward(self, value):
+            return self.o_proj(torch.relu(self.q_proj(self.norm(value))))
+
+    config = FrameworkConfig.from_dict(
+        {"parallel": {"tp_size": world, "sp_backend": "megatron"}})
+
+    torch.manual_seed(5)
+    runtime = Runtime(device="cpu", init_process_group=False, seed=5)
+    try:
+        parallelize(Block(RMSNorm(8)), config=config, runtime=runtime)
+    except TPConfigurationError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError(
+            "SP over an RMSNorm model did not refuse; it would have run with "
+            "sequence parallelism configured and silently not applied")
+
+    # The counterfactual, in the same case so the two cannot drift apart: the
+    # identical block with a LayerNorm must go through.  Without this, a guard
+    # that refused everything would pass the assertion above.
+    torch.manual_seed(5)
+    runtime = Runtime(device="cpu", init_process_group=False, seed=5)
+    model = parallelize(Block(torch.nn.LayerNorm(8)), config=config, runtime=runtime)
+    weight = model.norm.weight
+    return {"rank": rank, "refused": True, "message": message,
+            "accepted_norm_weight_type": type(weight).__name__,
+            "accepted_norm_placements": str(getattr(weight, "placements", None))}
+
+
 @case("ulysses_seq_lens_refuses")
 def ulysses_seq_lens_refuses(rank: int, world: int, dist, options: dict) -> dict:
     """The variable-length path must refuse loudly instead of approximating."""

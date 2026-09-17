@@ -71,3 +71,54 @@ def test_sequence_parallel_does_not_wrap_dropout():
 
     assert sorted(sequence_parallel_styles(Block())) == ["inner.0", "norm"], (
         "dropout must stay outside the sequence-parallel region")
+
+
+def test_sequence_parallel_refuses_a_model_it_cannot_shard():
+    """SP over a model with no ``nn.LayerNorm`` must refuse, not silently no-op.
+
+    The style matches norms structurally rather than by name -- which is what
+    keeps sequence parallelism free of any naming convention on the model -- and
+    the price is that a model using a different norm matches nothing at all.
+    Measured before this guard existed: a Llama-shaped ``nn.RMSNorm`` model at
+    ``tp_size=2`` with ``sp_backend='megatron'`` raised nothing and left every
+    norm's weight a plain ``Parameter``, so the run had sequence parallelism
+    configured, reported, and not applied.  The loss curve cannot show it, since
+    SP is an activation-layout optimisation.
+
+    This is the guard ``parallelize_tensor_parallel`` already had for TP ("the
+    plan names no module to shard"); only that side had one.
+    """
+    from aitrainer.parallel.tp import (
+        TPConfigurationError,
+        require_sequence_parallel_targets,
+    )
+
+    class RMSNorm(torch.nn.Module):
+        """Llama's norm, and not a ``torch.nn.LayerNorm``."""
+
+        def __init__(self, dim: int) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(dim))
+
+        def forward(self, value):
+            return value / value.norm(dim=-1, keepdim=True).clamp(min=1e-6) * self.weight
+
+    class Block(torch.nn.Module):
+        def __init__(self, norm) -> None:
+            super().__init__()
+            self.norm = norm
+            self.q_proj = torch.nn.Linear(8, 8)
+
+    with pytest.raises(TPConfigurationError, match="no torch.nn.LayerNorm"):
+        require_sequence_parallel_targets(Block(RMSNorm(8)))
+
+    # The counterfactual: the same block with a LayerNorm passes, so the refusal
+    # is about the norm type and not about the block's shape.
+    require_sequence_parallel_targets(Block(torch.nn.LayerNorm(8)))
+
+    # A subclass counts too.  ``isinstance`` rather than an exact type check, so
+    # a model that subclasses LayerNorm to add a flag is not refused for it.
+    class Derived(torch.nn.LayerNorm):
+        pass
+
+    require_sequence_parallel_targets(Block(Derived(8)))

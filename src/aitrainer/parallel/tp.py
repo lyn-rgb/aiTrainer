@@ -188,7 +188,6 @@ def sequence_parallel_styles(module: Any, *, sequence_dim: int = 1) -> dict[str,
     See :func:`_sharded_norm_style` for why this is a custom style and not
     torch's ``SequenceParallel``.
     """
-    import torch
     style = _sharded_norm_style(sequence_dim)
     # LayerNorm only -- NOT nn.Dropout, which an earlier version wrapped here too.
     #
@@ -210,9 +209,56 @@ def sequence_parallel_styles(module: Any, *, sequence_dim: int = 1) -> dict[str,
     # `_sharded_norm_style`), so a dropout that follows a norm sees the whole
     # sequence on every rank and reproduces one process exactly.  Sequence
     # parallelism here shards each norm's own activation, nothing else.
-    supported = (torch.nn.LayerNorm,)
     return {name: style for name, child in module.named_modules()
-            if name and isinstance(child, supported)}
+            if name and isinstance(child, sequence_parallel_types())}
+
+
+def sequence_parallel_types() -> tuple[Any, ...]:
+    """The module types the SP style can shard, in one place.
+
+    ``torch.nn.LayerNorm`` and its subclasses.  Matching structurally rather
+    than by name is what keeps sequence parallelism from imposing a naming
+    convention on the model -- but it also means any OTHER norm type matches
+    nothing at all, which :func:`require_sequence_parallel_targets` exists to
+    turn into an error instead of a silent no-op.
+    """
+    import torch
+
+    return (torch.nn.LayerNorm,)
+
+
+def require_sequence_parallel_targets(module: Any) -> None:
+    """Refuse sequence parallelism over a model that has no norm it can shard.
+
+    The case this catches, measured: a Llama-shaped model using ``nn.RMSNorm``
+    at ``tp_size=2`` with ``sp_backend='megatron'``.  The TP plan matched its
+    projections, so ``parallelize_tensor_parallel`` had no reason to complain,
+    and ``sequence_parallel_styles`` returned ``{}`` -- the run then trained
+    with sequence parallelism configured, reported, and not applied.  Every
+    norm's weight stayed a plain ``Parameter``.  The loss curve is unaffected
+    (SP is an activation-layout optimisation), so nothing surfaces it.
+
+    This is the same failure ``parallelize_tensor_parallel`` already refuses for
+    TP -- "the plan names no module to shard" -- and it was only guarded on that
+    side.  A model with no ``LayerNorm`` anywhere has nothing for SP to do on
+    ANY stage, so refusing is never rejecting a working configuration.
+
+    Checked against the **whole model**, not this rank's stage: under pipeline
+    parallelism a stage legitimately holds no norm (an embedding-only first
+    stage, say), and refusing that would reject a working split.  Every rank
+    reaches the same verdict because every rank sees the same unsplit model, so
+    the failure is a clean error on all ranks rather than a hang on one.
+    """
+    for _, child in module.named_modules():
+        if isinstance(child, sequence_parallel_types()):
+            return
+    raise TPConfigurationError(
+        "parallel.sp_backend is set but this model contains no torch.nn.LayerNorm, "
+        "which is the only norm the sequence-parallel style can shard -- so it "
+        "would run with sequence parallelism configured and not applied, and "
+        "nothing would report it. A model using a different norm (nn.RMSNorm, or "
+        "a custom one) needs that type added to "
+        "parallel.tp.sequence_parallel_types(), or set sp_backend='none'.")
 
 
 def reduce_replicated_gradients(module: Any) -> int:
