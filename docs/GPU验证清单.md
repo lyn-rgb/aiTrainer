@@ -174,6 +174,28 @@ bash scripts/run_all_tests.sh --world-size 4 --report-dir artifacts/gpu_report
 
 ---
 
+### C5. CUDA 上 `scaled_dot_product_attention` 是否需要本地往返
+
+**断言（待检验）**：GPU 上 DTensor 可能**有** flash 算子的分片策略，那样
+`examples/llama_shaped/model.py` 的 `_per_head` 本地往返就是多余的。
+
+**本机为什么测不到**：CPU 上确定没有 —— 实测
+`NotImplementedError: Operator aten._scaled_dot_product_flash_attention_for_cpu.default
+does not have a sharding strategy registered.`。CUDA 的 flash 变体在 torch 里有注册，
+但**我没在 GPU 上跑过**。
+
+**怎么测**：GPU 上把 `_per_head` 换成直接调用 `SDPA(query, key, value)`，跑 3 步，
+比较 loss。
+
+**预期**：若 CUDA 有策略 → 去掉往返后 loss 不变，且少两次 `to_local`/`from_local`
+（通信量不变，省的是打包开销）；若报同样的 `NotImplementedError` → **不能去**，
+说明这是算子覆盖问题而非后端问题。
+
+**失败意味着**：去掉后 loss 变化 → CUDA 的策略语义与"逐 head 独立"不等价，
+应保留往返并记录原因。
+
+---
+
 ## D. 本机已充分验证，GPU 上只需确认"没变"
 
 这些**不需要重新推导**，跑一遍确认即可 —— 如果它们变了，说明 GPU 走了别的代码路径：

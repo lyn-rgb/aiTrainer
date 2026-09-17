@@ -6,6 +6,9 @@ FSDP / TP / SP / PP / offload interfaces with conservative capability boundaries
 
 **Architecture**: [`docs/架构.md`](docs/架构.md) has the layered module map and
 the dependency contracts that CI enforces.
+[`docs/使用指南.md`](docs/使用指南.md) is the one to read first if you are
+bringing your own model: what each parallel axis needs from it, what it costs,
+and a runnable Llama-shaped example with measured numbers.
 [`docs/GPU验证清单.md`](docs/GPU验证清单.md) lists what cannot be settled on a
 CPU/Gloo host and how to check it on a real one.
 `docs/路线图.md` and `docs/开发方案与开发规划.md` describe a *target* state, not
@@ -63,6 +66,21 @@ sharded checkpoint tell one logical tensor apart from one rank's slice of it.
 `parallelize()` applies TP before FSDP wrapping, using orthogonal groups, and a
 plan that names no module is **refused** rather than leaving every rank a full
 replica.
+
+A column projection hands the model a `DTensor` that still carries its
+placement; a row projection hands back a plain tensor. That asymmetry is
+load-bearing and was got wrong once. torch defaults `use_local_output=True`,
+which redistributes to the requested layout and then discards it with
+`to_local()` — fine for a chain of projections and elementwise ops, which is
+what every TP test here used to be, and impossible for any model that needs to
+know the shape of what it is holding. A Llama-shaped attention hit it at
+`.view(B, L, heads, head_dim)` with `shape is invalid for input of size 256`,
+naming neither tensor parallelism nor the plan. Keeping the placement on
+**both** projections is also wrong: the residual stream is the embedding's
+plain output, so `hidden + attn(...)` then fails with `got mixed
+torch.Tensor and DTensor`. Column keeps it, row returns to plain, and the
+sharding never escapes the attention/MLP region.
+`TransformerTPPlan.keep_placements=False` restores the old behaviour.
 
 **SP** — sequence-parallel activation of each norm over the TP group
 (`sequence_parallel_styles`). Norms are matched **structurally**, by type, so

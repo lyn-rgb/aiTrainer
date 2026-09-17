@@ -12,6 +12,11 @@ class TransformerTPPlan:
 
     column_suffixes: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "linear1")
     row_suffixes: tuple[str, ...] = ("o_proj", "out_proj", "down_proj", "linear2")
+    # Whether a COLUMN projection hands the model a ``DTensor`` that still
+    # carries its placement, or a plain local tensor.  Row projections always
+    # return a plain tensor; see ``styles`` for why the rule is asymmetric and
+    # for the measurement that settled it.
+    keep_placements: bool = True
 
     def role(self, name: str) -> str | None:
         leaf = name.rsplit(".", 1)[-1]
@@ -35,6 +40,64 @@ class TransformerTPPlan:
         pretend to: sequence parallelism here shards each norm's own activation
         and gathers it back (see ``parallel.tp._sharded_norm_style``), which is
         what the previous hand-written implementation did too.
+
+        ``keep_placements`` decides whether a projection hands the model a
+        ``DTensor`` or a plain local tensor, and it is not a performance knob --
+        it decides which models can be sharded at all.
+
+        torch defaults ``use_local_output=True``, which redistributes the output
+        to the requested placement and then throws the placement away with
+        ``to_local()``.  Measured on a Llama-shaped block at ``tp_size=2``: the
+        weight came back ``DTensor(32, 32) local=(16, 32) placements=(Shard(0),)``
+        -- correctly sharded -- while ``q_proj(hidden)`` came back
+        ``Tensor(2, 8, 16)``.  Sixteen features where the model's own weights
+        say thirty-two, and nothing in the tensor says why.  The model then
+        fails at ``.view(2, 8, 4, 8)``, an error about reshape sizes that names
+        neither tensor parallelism nor the plan, and it CANNOT defend itself:
+        recovering would mean dividing the head count by a ``tp_size`` it has no
+        way to see.
+
+        Why this never showed up before: under the local arrangement the
+        activation between a column and a row projection is each rank's slice,
+        and ``RowwiseParallel`` annotates a plain tensor as ``Shard(-1)`` while
+        ``ColwiseParallel`` annotates one as ``Replicate()``.  Those two agree,
+        so a chain of projections and elementwise ops -- which is what every TP
+        test in this repository uses -- is exactly right.  It breaks the moment
+        the model needs to know the SHAPE of what it is holding, which is any
+        attention with a head reshape.
+
+        Keeping the placement makes the model's own arithmetic the thing that
+        carries the sharding: ``.view(B, L, heads, head_dim)`` propagates
+        ``Shard(-1) -> Shard(2)`` when the head boundary lines up with the shard
+        boundary, and DTensor raises where it cannot.  Set this to False to get
+        the old local behaviour back, but then every model must be written for
+        it.
+
+        **The rule is asymmetric, and the first version of this got it wrong.**
+        It kept placements on BOTH projections, which broke the residual stream
+        at the first add::
+
+            hidden = hidden + self.self_attn(self.input_layernorm(hidden))
+            RuntimeError: aten.add.Tensor: got mixed torch.Tensor and DTensor,
+            need to convert all torch.Tensor to DTensor before calling
+            distributed operators!
+
+        ``hidden`` is the embedding's output -- no projection touches it, so it
+        is a plain tensor -- while the row projection was handing back a
+        ``DTensor``.  A residual stream cannot be half-sharded: the embedding
+        and the norms are not, so a projection that returns a DTensor forces
+        every one of them to become parallelism-aware too.
+
+        So a **column** projection keeps its placement -- its output is what the
+        model reshapes, and the model is the only thing that knows the reshape
+        is a head split rather than a feature split -- and a **row** projection
+        returns a plain tensor, because it is the one that goes back into the
+        residual stream and it has already been reduced to ``Replicate`` by
+        then, so ``to_local()`` is lossless.
+
+        That is also why no model-side change is needed beyond the ops DTensor
+        cannot dispatch: the sharding stays inside the attention/MLP region and
+        the residual stream never sees it.
         """
         import torch
         from torch.distributed.tensor import Shard
@@ -46,8 +109,15 @@ class TransformerTPPlan:
                 continue
             role = self.role(name)
             if role == "column":
-                styles[name] = ColwiseParallel(output_layouts=Shard(-1))
+                styles[name] = ColwiseParallel(
+                    output_layouts=Shard(-1),
+                    use_local_output=not self.keep_placements)
             elif role == "row":
+                # Always local: by the time this returns, the all-reduce has
+                # already made the value Replicate, so to_local() loses nothing,
+                # and whatever consumes it is back in the unsharded residual
+                # stream.  See the class docstring above for the mixed-tensor
+                # error that made this the rule.
                 styles[name] = RowwiseParallel()
         return styles
 
