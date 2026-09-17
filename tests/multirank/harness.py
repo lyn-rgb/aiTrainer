@@ -22,6 +22,33 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).resolve().parent / "worker.py"
 
 
+def _require_numpy() -> None:
+    """Fail once, here, rather than once per worker case.
+
+    numpy is a declared dev dependency because ``torch.distributed`` needs it
+    and torch does not depend on it: ``all_gather_object`` round-trips a Python
+    object through ``tensor.numpy()``, so a worker that gathers anything dies
+    with ``RuntimeError: Numpy is not available`` raised from inside c10d.  On a
+    clean install that is 35 failures whose tracebacks name neither numpy nor
+    the missing declaration, and the ones that fail first do not look alike --
+    a case that reads its gathered payload afterwards reports ``KeyError:
+    'keys'``, because the gather never filled it in.
+
+    Checked in the parent, which is the process that can report it clearly.
+    """
+    try:
+        import numpy  # noqa: F401
+    except ImportError as exc:                                   # pragma: no cover
+        raise RuntimeError(
+            "the multi-rank tests need numpy: torch.distributed.all_gather_object "
+            "goes through tensor.numpy() internally, and torch does not declare "
+            "numpy as a dependency. Install the dev extra (pip install -e \".[dev]\") "
+            "or pip install numpy.") from exc
+
+
+_require_numpy()
+
+
 @dataclass(frozen=True)
 class RankResult:
     rank: int
