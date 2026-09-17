@@ -16,10 +16,19 @@ the code as it stands; `docs/代码审计报告.md` records the defect history a
 was verified empirically.
 
 ```bash
-pip install -e .
+bash scripts/create_venv.sh          # creates .venv/ and proves it can train
+source .venv/bin/activate            # or just use .venv/bin/python
+
 python examples/tiny_transformer/train.py
 pytest
 ```
+
+`create_venv.sh` takes `--cuda cu126` (pick the wheel line that matches your
+driver), `--cpu`, `--force` and `--no-smoke`; it prints what actually landed
+(torch version, whether CUDA and NCCL are there) and finishes by training three
+steps, so a broken environment fails at creation rather than at first use. The
+project's only runtime dependency is torch — see `docs/使用指南.md` §0 for what
+a GPU host has to provide.
 
 ---
 

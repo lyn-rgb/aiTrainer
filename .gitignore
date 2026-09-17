@@ -5,6 +5,10 @@ __pycache__/
 build/
 dist/
 
+# The virtualenv scripts/create_venv.sh creates, at the repo root.  Without
+# this, running that script and then `git add -A` stages several thousand files.
+.venv/
+
 # Test / lint caches
 .pytest_cache/
 .ruff_cache/
