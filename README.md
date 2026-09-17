@@ -232,7 +232,22 @@ what covers the optimizer's momentum, the step counters and every RNG stream.  A
 report ends with a table of every combination against every other, so "these are
 equivalent ways to run one training" is stated without reference to a baseline.
 
-It has found three real defects that every existing test missed.  Both pipeline
+It has found four real defects that every existing test missed.  The fourth is
+the one worth reading the audit report for: with `tp_size>1`, sequence
+parallelism on and `dp_size=1`, a sharded checkpoint restored the parameters
+bit for bit and the optimizer momentum wrongly, so a resumed run continued 2e-01
+away from the run that wrote it.  The cause was not the checkpoint.  Sequence
+parallelism feeds each norm a *slice* of the sequence, so the norm's replicated
+parameters accumulate a `Partial` (per-rank partial sum) gradient that autograd
+never reduces -- the parameter update comes out right anyway, because DTensor
+reduces when it computes the new parameter value, so only the optimizer's state,
+gradient clipping, and anything checkpointing them were wrong.  FSDP hid it by
+wrapping the parameters again, and `tp_size=1` never produces it.  A first fix
+using a `post_accumulate_grad_hook` worked in isolation and was dead in the
+framework's own path: `Trainer.__init__` calls `model.to()`, one call of which
+stops that hook firing on a DTensor parameter, silently, forever.
+
+The other three.  Both pipeline
 schedules backpropagated a stage's received *activation* instead of its produced
 *output*, leaving every interior stage's parameters at `grad is None` for the
 whole run while the loss stayed correct and `backward_complete` reported true (at

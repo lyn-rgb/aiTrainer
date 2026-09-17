@@ -174,8 +174,9 @@ def test_sequence_parallel_matches_dense():
     autograd supply the all-gather that the hand-written ``gather_sequence``
     used to do.
     """
-    for payload in require_success(run_case("sequence_parallel_matches_dense", 2,
-                                            hard_timeout=120.0)):
+    payloads = require_success(run_case("sequence_parallel_matches_dense", 2,
+                                        hard_timeout=120.0))
+    for payload in payloads:
         assert payload["forward_error"] < TOLERANCE
         assert payload["input_grad_error"] < TOLERANCE, (
             "the input gradient through the sharded norm is wrong; this is what a "
@@ -183,6 +184,39 @@ def test_sequence_parallel_matches_dense():
         assert payload["weight_grad_error"] < TOLERANCE, (
             "the replicated norm parameters did not receive the reduced gradient")
         assert payload["bias_grad_error"] < TOLERANCE
+
+        # The error columns above are all computed through ``full_tensor()``,
+        # which ALL-REDUCES a Partial placement -- so a norm gradient that was
+        # never reduced compares EQUAL to the dense reference and every
+        # assertion above passes anyway.  Measured: with the reduction removed
+        # this whole test still passed, while SGD's momentum buffer came back
+        # ``(Partial(sum),)`` holding each rank's own partial sum, and a
+        # checkpoint written from it resumed 2.08e-01 away from the run that
+        # wrote it.
+        #
+        # These are the assertions that go red instead.  First the cause:
+        assert "Partial" in payload["raw_grad_placements"], (
+            "a backward over the sequence-sharded norm should leave the "
+            "replicated parameters holding a per-rank partial sum; if this is "
+            "no longer true, torch has started reducing it and "
+            "reduce_replicated_gradients is doing a second all-reduce for "
+            f"nothing.  Got {payload['raw_grad_placements']!r}")
+
+        # Then the consequence, measured through the path that trains: the
+        # momentum the optimizer actually stores must be Replicate and must
+        # agree rank to rank.  It is the optimizer's state, not the parameter
+        # update, that a sharded checkpoint carries -- the update comes out
+        # right either way, because DTensor reduces when it computes the new
+        # parameter value.
+        assert "Replicate" in payload["momentum_placements"], (
+            "the optimizer's momentum buffer is not replicated, so each rank "
+            "stores a different partial sum; the update still looks right, but "
+            "gradient clipping and every checkpoint of this state are wrong.  "
+            f"Got {payload['momentum_placements']!r}")
+        locales = [item["momentum_local"] for item in payloads]
+        assert all(item == locales[0] for item in locales), (
+            "the replicated norm parameters hold different optimizer momentum "
+            "on different ranks, so they are not replicated")
 
         observed = payload["observed"]
         assert observed["type"] == "DTensor", (

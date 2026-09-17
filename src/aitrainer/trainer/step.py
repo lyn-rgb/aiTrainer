@@ -37,6 +37,15 @@ def run_optimizer_step(trainer: Any) -> tuple[float | None, bool]:
     torch = require_torch("aiTrainer training requires PyTorch; install the project's torch dependency")
     if trainer.scaler.is_enabled():
         trainer.scaler.unscale_(trainer.optimizer)
+    # Sequence parallelism shards each norm's activation, so the norm's
+    # replicated parameters accumulate a Partial (per-rank partial sum)
+    # gradient that nothing reduces.  Doing it here -- before clipping and
+    # before the optimizer -- is what makes the momentum buffers correct and
+    # rank-consistent, and what stops gradient clipping from taking the norm of
+    # a partial sum.  See parallel.tp.reduce_replicated_gradients; it is a
+    # no-op for every model with no Partial gradients.
+    from ..parallel.tp import reduce_replicated_gradients
+    reduce_replicated_gradients(trainer.model.module)
     cast_gradients(trainer.model.parameters(), trainer.config.precision.grad_dtype, torch_module=torch)
     grad_norm = None
     if trainer.config.grad_clip_norm is not None:

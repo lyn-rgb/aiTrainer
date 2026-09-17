@@ -102,12 +102,44 @@ def _sharded_norm_style(sequence_dim: int) -> Any:
       reduce-scatters -- which is what the old ``gather_from_sequence`` did by
       hand.
 
-    The replicated parameters' gradients need no ``register_hook``: DTensor
-    propagates a Partial gradient for a Replicate parameter fed by a sharded
-    activation and reduces it in autograd.  That is the property
-    ``test_sequence_parallel_layernorm_gradients_match_dense`` and its
-    ``..._reduction_is_load_bearing`` counterfactual check -- the old code did
-    this reduction by hand, and without it the copies diverged.
+    The replicated parameters' gradients need reducing by hand, and an earlier
+    version of this docstring claimed the opposite -- that DTensor "propagates a
+    Partial gradient for a Replicate parameter fed by a sharded activation and
+    reduces it in autograd".  Measured: it propagates the Partial and never
+    reduces it.  At world=2 the norm parameters' ``.grad`` came back
+    ``(Partial(sum),)`` with rank-local values that differ, while a Replicate
+    parameter fed by a *Replicate* activation (a row projection's bias) comes
+    back ``(Replicate(),)`` and agrees.  So the placement is decided by what
+    feeds the module, not normalised on the way out.
+
+    That left three symptoms, and the quiet ones are the dangerous ones:
+
+    * the parameter *update* was still correct, because DTensor reduces when it
+      computes the new parameter value, so the loss curve and the weights after
+      a step both look right;
+    * the *optimizer state* was not: SGD's momentum buffer ends up
+      ``(Partial(sum),)`` holding each rank's own partial sum, so the ranks
+      store different momentum.  A sharded checkpoint then has one rank's
+      partial sum to write, and restoring it gave every rank that same wrong
+      buffer -- a resumed run diverged by 2.08e-01 while the write/read of the
+      weights themselves stayed bit-for-bit exact;
+    * anything reading ``.grad`` directly was wrong, gradient clipping included,
+      since it would clip the norm of a partial sum.
+
+    The reduction is :func:`reduce_replicated_gradients`, called from the
+    optimizer step rather than installed here as a tensor hook.  A
+    ``register_post_accumulate_grad_hook`` on these parameters looks like the
+    natural home and does work -- measured, the gradient came back
+    ``(Replicate(),)`` agreeing across ranks.  It is wrong anyway, and silently
+    so: **one call to ``model.to(device)`` permanently stops the hook firing**
+    on these DTensor parameters.  ``nn.Module.to`` repoints ``.data``, the hook
+    stays listed on the parameter, ``.grad`` still gets populated -- with the
+    unreduced Partial -- and nothing raises.  ``Trainer.__init__`` calls
+    ``.to()`` on every model it wraps, so a hook installed here would be dead in
+    the framework's own path while looking correct in isolation.  Reducing where
+    the gradient is CONSUMED instead needs no assumption about who has moved the
+    model, and costs one collective per optimizer step rather than one per
+    microbatch.
     """
     from torch.distributed.tensor import DTensor, Replicate, Shard
     from torch.distributed.tensor.parallel import ParallelStyle
@@ -181,6 +213,52 @@ def sequence_parallel_styles(module: Any, *, sequence_dim: int = 1) -> dict[str,
     supported = (torch.nn.LayerNorm,)
     return {name: style for name, child in module.named_modules()
             if name and isinstance(child, supported)}
+
+
+def reduce_replicated_gradients(module: Any) -> int:
+    """All-reduce every replicated parameter's still-Partial gradient, in place.
+
+    :func:`_sharded_norm_style` hands the module a ``Shard(sequence_dim)``
+    activation, so the norm's ``Replicate`` parameters accumulate a
+    ``(Partial(sum),)`` gradient -- each rank holding its own partial sum -- and
+    nothing reduces it.  Returns how many parameters were reduced.
+
+    Called from ``trainer.step.run_optimizer_step`` before clipping and
+    ``optimizer.step``, because a tensor hook cannot be used: see
+    :func:`_sharded_norm_style` for the measured reason (``model.to()`` silently
+    disables one).  Reducing at the point of consumption also means once per
+    optimizer step instead of once per microbatch, and it fixes gradient
+    clipping, which would otherwise take the norm of a partial sum.
+
+    Only two things are touched, and both conditions have to hold:
+
+    * the **parameter** is entirely replicated, so the sum over ranks is what it
+      should hold.  A sharded parameter's gradient is a shard, never a Partial,
+      and reducing one would produce a full tensor for a shard-shaped
+      parameter;
+    * the **gradient** is entirely Partial.  A mixed placement (``Partial`` on
+      one mesh axis and ``Shard`` on another) is not a case this framework
+      produces, and guessing at it would be worse than leaving it alone.
+
+    Anything else is untouched, so on the ordinary all-Replicate path this
+    walks the parameters and does nothing.
+    """
+    from torch.distributed.tensor import DTensor, Replicate
+
+    reduced = 0
+    for parameter in module.parameters():
+        placements = getattr(parameter, "placements", None)
+        if placements is None or not all(item.is_replicate() for item in placements):
+            continue
+        gradient = parameter.grad
+        if not isinstance(gradient, DTensor):
+            continue
+        if not gradient.placements or not all(item.is_partial() for item in gradient.placements):
+            continue
+        parameter.grad = gradient.redistribute(
+            placements=tuple(Replicate() for _ in gradient.placements))
+        reduced += 1
+    return reduced
 
 
 def parallelize_tensor_parallel(module: Any, *, styles: dict[str, Any], mesh: Any = None,

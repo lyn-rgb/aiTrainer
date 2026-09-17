@@ -308,12 +308,29 @@ def tensor_parallel_refuses_an_unmatched_plan(rank: int, world: int, dist, optio
     return {"rank": rank, "refused": False, "message": ""}
 
 
+def _trainer_over(model, world: int, runtime):
+    """A Trainer over an already-parallelised block, for optimizer-state checks.
+
+    Momentum rather than plain SGD: without state there is nothing to inspect,
+    and a resumed trainer that never restored its optimizer would step
+    identically.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Trainer
+
+    config = FrameworkConfig.from_dict(
+        {"parallel": {"tp_size": world, "sp_backend": "megatron"}})
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+    return Trainer(model, optimizer, config=config, runtime=runtime,
+                   loss_fn=lambda output, batch: torch.nn.functional.mse_loss(output, batch[1]))
+
+
 @case("sequence_parallel_matches_dense")
 def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) -> dict:
     """SP inside the norms must equal the dense model, and must really shard.
 
-    Two independent claims, and the second is the one that cannot be seen in
-    the numbers:
+    Three independent claims, and the last two cannot be seen in the numbers:
 
     * numerics -- forward, the replicated norm parameters' gradients, and the
       input gradient all match a dense reference.  The input gradient is the
@@ -329,6 +346,13 @@ def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) 
       dense reference exactly -- same numbers, no communication -- so the
       layout observation is the only thing standing between "sequence
       parallel" and "a no-op that reports success".
+    * that the optimizer's momentum ends up REPLICATED and identical across
+      ranks.  A ``Shard`` activation leaves a ``Partial`` gradient on the
+      replicated parameters and autograd does not reduce it, so the momentum
+      buffer holds each rank's own partial sum while the parameter update still
+      comes out right.  Checked through a real ``train_step``, because the
+      reduction lives in the optimizer step and a bare backward cannot reach it.
+      See ``parallel.tp.reduce_replicated_gradients``.
     """
     import torch
 
@@ -364,12 +388,43 @@ def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) 
     output = model(inputs)
     forward_error = _max_abs_diff(output, dense(value))
     output.square().mean().backward()
-    return {"rank": rank, "forward_error": forward_error,
-            "input_grad_error": _max_abs_diff(_full(inputs.grad), value.grad),
-            "weight_grad_error": _max_abs_diff(_full(model.norm.weight.grad),
-                                               dense.norm.weight.grad),
-            "bias_grad_error": _max_abs_diff(_full(model.norm.bias.grad), dense.norm.bias.grad),
-            "observed": observed, "world": world, "sequence_length": length}
+
+    # The error columns above all go through ``_full``, and ``full_tensor()``
+    # ALL-REDUCES a ``Partial`` placement -- so a gradient that was never
+    # reduced compares EQUAL to the dense reference and every check passes
+    # anyway.  What that hides is below, in two halves.
+    gradient = model.norm.weight.grad
+
+    # Read everything about this backward BEFORE stepping a trainer: train_step
+    # ends in ``optimizer.zero_grad(set_to_none=True)``, which would clear these.
+    numeric = {
+        "rank": rank, "forward_error": forward_error,
+        "input_grad_error": _max_abs_diff(_full(inputs.grad), value.grad),
+        "weight_grad_error": _max_abs_diff(_full(gradient), dense.norm.weight.grad),
+        "bias_grad_error": _max_abs_diff(_full(model.norm.bias.grad), dense.norm.bias.grad),
+        "observed": observed, "world": world, "sequence_length": length,
+    }
+    # 1. The cause.  A bare backward over a sharded activation leaves the norm's
+    #    Replicate parameters holding a per-rank PARTIAL SUM, and nothing in
+    #    autograd reduces it.  Asserted rather than merely reported: it is the
+    #    reason the reduction below has to exist, and if a future torch starts
+    #    reducing on its own this is the line that says so.
+    numeric["raw_grad_placements"] = str(getattr(gradient, "placements", None))
+
+    # 2. The consequence, through the path that actually trains.  The reduction
+    #    runs in the optimizer step (parallel.tp.reduce_replicated_gradients),
+    #    NOT as a tensor hook -- a hook is silently disabled by ``model.to()``,
+    #    which Trainer.__init__ always calls.  So the check has to step a real
+    #    Trainer: a bare backward cannot show it.
+    trainer = _trainer_over(model, world, runtime)
+    generator = torch.Generator().manual_seed(11)
+    trainer.train_step((torch.randn(batch, length, hidden, generator=generator),
+                        torch.randn(batch, length, hidden, generator=generator)))
+    buffer = trainer.optimizer.state[model.norm.weight]["momentum_buffer"]
+    numeric["momentum_placements"] = str(getattr(buffer, "placements", None))
+    numeric["momentum_local"] = (buffer.to_local().flatten().tolist()
+                                 if hasattr(buffer, "to_local") else None)
+    return numeric
 
 
 # §4.10 d -- Ulysses attention
