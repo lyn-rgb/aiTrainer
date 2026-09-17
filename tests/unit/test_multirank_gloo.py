@@ -39,6 +39,34 @@ from tests.multirank.harness import require_success, run_case
 TOLERANCE = 1e-6
 
 
+def same_weights(left, right, what: str) -> None:
+    """Assert two runs produced the same weights, to ``TOLERANCE`` and not bit-for-bit.
+
+    The distinction this draws is the whole point.  A weight that differs by a
+    few ULP is not a divergence -- it is the same training computed through a
+    different summation order, and ``==`` on a list of float32 values reports it
+    as a failure.  Measured on the Linux runner: two configurations that agree
+    to the last bit on the development host differed by ``1.9e-09`` on a value
+    of ``0.02``, which is about one ULP of float32 (eps 1.19e-07).  A real
+    divergence is O(value), so 1e-6 still catches every one of them.
+
+    This is not a relaxation introduced to quiet a red build.  The file already
+    made this comparison with a tolerance in
+    ``test_checkpoint_roundtrip_at_two_ranks``' sibling, for exactly this reason
+    and with this exact constant; the assertions converted here were the
+    inconsistency, not the rule.
+
+    Discrete values stay exact: ``applied`` is a list of booleans and
+    ``global_step`` an int, and neither has a rounding story to tell.
+    """
+    assert len(left) == len(right), (
+        f"{what}: {len(left)} values against {len(right)} -- not the same set of tensors")
+    worst = max((abs(a - b) for a, b in zip(left, right)), default=0.0)
+    assert worst < TOLERANCE, (
+        f"{what}: max|diff| = {worst:.3e} exceeds {TOLERANCE:g}. A few ULP is "
+        f"rounding; this is a real divergence.")
+
+
 @pytest.mark.parametrize("shape", ["2,2,1", "2,1,2", "1,2,2"])
 def test_group_creation_membership_at_four_ranks(shape):
     """All ranks must create identical group sequences and get their own groups."""
@@ -518,8 +546,8 @@ def test_pipeline_production_path_matches_single_process(schedule):
     assert len(replicas) == 2
     joined = replicas[0]["parameters"] + replicas[1]["parameters"]
     assert len(joined) == len(reference["parameters"]), "the two stages must partition the model"
-    assert joined == reference["parameters"], "pipeline parameters diverged from single-process"
-    assert replicas[1]["losses"] == reference["losses"], "last-stage loss diverged"
+    same_weights(joined, reference["parameters"], "pipeline parameters")
+    same_weights(replicas[1]["losses"], reference["losses"], "last-stage loss")
     assert all(payload["global_step"] == reference["global_step"] for payload in replicas)
 
 
@@ -543,7 +571,7 @@ def test_pipeline_accumulation_drops_the_trailing_window():
     for payload in replicas:
         assert payload["applied"] == reference["applied"]
     joined = replicas[0]["parameters"] + replicas[1]["parameters"]
-    assert joined == reference["parameters"], "accumulated pipeline weights diverged"
+    same_weights(joined, reference["parameters"], "accumulated pipeline weights")
 
 
 @pytest.mark.parametrize("mode", ["fsdp", "tp"])
