@@ -53,8 +53,10 @@ def capability_matrix() -> tuple[Capability, ...]:
         Capability("sp", CapabilityStatus.STABLE,
                    "sequence-parallel activations over the TP group; config selects only "
                    "'megatron', and 'ulysses' is refused rather than accepted-and-ignored. "
-                   "The Ulysses head exchange itself is a separate explicit API that needs "
-                   "NCCL -- see UlyssesAttention / distributed_attention"),
+                   "The Ulysses head exchange is a separate explicit API -- see "
+                   "UlyssesAttention / distributed_attention. Its all_to_all needs NCCL "
+                   "on torch 2.9.1 and runs on Gloo from 2.14.0, where it matches dense "
+                   "SDPA to 1.79e-07 at world=2."),
         Capability("pp_gpipe_1f1b", CapabilityStatus.STABLE,
                    "non-interleaved pipeline schedules with synchronous P2P"),
         Capability("offload_optimizer", CapabilityStatus.STABLE, "CPU optimizer/state lifecycle"),

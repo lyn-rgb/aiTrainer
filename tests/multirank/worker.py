@@ -88,6 +88,8 @@ def groups_legacy_order_deadlocks(rank: int, world: int, dist, options: dict) ->
     what makes group creation terminate, rather than asserting a green test with
     no counterfactual.
     """
+    import torch
+
     mapping = _mapping(world, options)
     coordinate = mapping.coordinate(rank)
     created = []
@@ -95,7 +97,11 @@ def groups_legacy_order_deadlocks(rank: int, world: int, dist, options: dict) ->
         axis_ranks = mapping.group_ranks(axis, coordinate)
         dist.new_group(list(axis_ranks))
         created.append(list(axis_ranks))
-    return {"rank": rank, "legacy_calls": created,
+    # The torch version is part of the result: this control reproduces on 2.9.1
+    # and does not on 2.14.0, so "the fix is load-bearing" is a claim about a
+    # torch, not a claim about this code.  Reported so the caller can say so
+    # rather than assert against whichever torch it happens to be running.
+    return {"rank": rank, "legacy_calls": created, "torch": torch.__version__,
             "note": "did not block, so the ordering fix is not load-bearing at this shape"}
 
 

@@ -119,14 +119,21 @@ Two constraints worth knowing before you hit them:
   returned wrong values there (max abs error 0.42 against dense SDPA). Pad the
   global sequence before sharding, or pass `seq_lens=None` for dense,
   evenly-divisible batches.
-- **Ulysses requires NCCL.** `all_to_all` has no Gloo implementation, so at
-  `world_size > 1` every Ulysses path raises `RuntimeError: Backend gloo does not
-  support alltoall` on a CPU/Gloo job however it is configured. That is why
-  `sp_backend='ulysses'` is refused rather than accepted: the head exchange is a
-  separate explicit API (`UlyssesAttention`, `distributed_attention`), and the
-  config value cannot select it on a backend where it cannot run. The norm
-  sequence sharding above uses only DTensor layout transitions and does run on
-  Gloo.
+- **Ulysses needed NCCL, and that is now a torch-version fact rather than a
+  property of the algorithm.** At torch 2.9.1 `all_to_all` has no Gloo
+  implementation, so every `world_size > 1` Ulysses path raises `RuntimeError:
+  Backend gloo does not support alltoall` on a CPU/Gloo job however it is
+  configured.  At torch 2.14.0 it runs on Gloo and matches dense SDPA to
+  1.79e-07 at world=2, measured on the CI runner.  The test that documented the
+  refusal said "when Gloo gains all-to-all this test starts failing, which is
+  the signal to turn on the equivalence check" -- it did, and the check is on,
+  covering both branches: refused with a message naming all-to-all, or correct
+  against dense SDPA. What it forbids is the third outcome, attention that is
+  neither. `sp_backend='ulysses'` stays refused because that value selects the
+  NORM sequence sharding, which is an on/off switch -- the head exchange is a
+  separate explicit API (`UlyssesAttention`, `distributed_attention`). The norm
+  sharding above uses only DTensor layout transitions and runs on Gloo at any
+  version.
 
 **PP** — ordered stage planning, explicit tensor metadata, synchronous P2P, and
 `GPipeSchedule` / `OneFOneBSchedule` (non-interleaved). `parallel/pp_schedule.py`
