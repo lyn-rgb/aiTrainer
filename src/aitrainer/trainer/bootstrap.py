@@ -43,7 +43,13 @@ def prepare(model_or_adapter: Any, *, config: Any = None, optimizer: Any = None,
         if optimizer is not None:
             raise ValueError("pass an optimizer factory/class when automatic parallel wrapping is enabled")
         from ..parallelizer import parallelize
-        model = parallelize(model, config=config, runtime=runtime_obj)
+        # An adapter may declare how its model's forward is composed, for models
+        # whose pipeline layers are not direct children.  Duck-typed rather than
+        # added to the ModelAdapter protocol: requiring it would invalidate every
+        # adapter already written against that protocol, and the ones that do not
+        # need it -- anything with a flat forward -- should not have to say so.
+        model = parallelize(model, config=config, runtime=runtime_obj,
+                            execution_order=getattr(model_or_adapter, "execution_order", None))
     if optimizer is not None and (optimizer_factory is not None or optimizer_cls is not None):
         raise ValueError("pass only one of optimizer, optimizer_factory, or optimizer_cls")
     if optimizer is None and optimizer_factory is not None:

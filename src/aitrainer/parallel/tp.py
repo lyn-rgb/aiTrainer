@@ -216,31 +216,43 @@ def sequence_parallel_styles(module: Any, *, sequence_dim: int = 1) -> dict[str,
 def sequence_parallel_types() -> tuple[Any, ...]:
     """The module types the SP style can shard, in one place.
 
-    ``torch.nn.LayerNorm`` and its subclasses.  Matching structurally rather
-    than by name is what keeps sequence parallelism from imposing a naming
-    convention on the model -- but it also means any OTHER norm type matches
-    nothing at all, which :func:`require_sequence_parallel_targets` exists to
-    turn into an error instead of a silent no-op.
+    Matching structurally rather than by name is what keeps sequence
+    parallelism from imposing a naming convention on the model -- but it also
+    means any OTHER norm type matches nothing at all, which
+    :func:`require_sequence_parallel_targets` exists to turn into an error
+    instead of a silent no-op.
+
+    ``nn.RMSNorm`` is included because the style is indifferent to which norm it
+    wraps: it shards the **sequence** axis and leaves the norm's own axis -- the
+    last one -- whole on every rank, so it applies to anything normalising over
+    the hidden dimension.  Measured against a dense reference at world=2, on a
+    block whose norm is ``nn.RMSNorm``: forward, input gradient and norm
+    parameter gradient all agree (see
+    ``test_sequence_parallel_matches_dense_rmsnorm``).  It is added only when
+    the installed torch has it, since ``nn.RMSNorm`` arrived in 2.4.
     """
     import torch
 
-    return (torch.nn.LayerNorm,)
+    rms_norm = getattr(torch.nn, "RMSNorm", None)
+    return (torch.nn.LayerNorm,) if rms_norm is None else (torch.nn.LayerNorm, rms_norm)
 
 
 def require_sequence_parallel_targets(module: Any) -> None:
     """Refuse sequence parallelism over a model that has no norm it can shard.
 
-    The case this catches, measured: a Llama-shaped model using ``nn.RMSNorm``
-    at ``tp_size=2`` with ``sp_backend='megatron'``.  The TP plan matched its
-    projections, so ``parallelize_tensor_parallel`` had no reason to complain,
-    and ``sequence_parallel_styles`` returned ``{}`` -- the run then trained
-    with sequence parallelism configured, reported, and not applied.  Every
-    norm's weight stayed a plain ``Parameter``.  The loss curve is unaffected
-    (SP is an activation-layout optimisation), so nothing surfaces it.
+    Measured before this guard existed, on a model using a norm type outside
+    ``sequence_parallel_types()`` at ``tp_size=2`` with ``sp_backend='megatron'``:
+    the TP plan matched the projections, so ``parallelize_tensor_parallel`` had
+    no reason to complain, and ``sequence_parallel_styles`` returned ``{}`` --
+    the run then trained with sequence parallelism configured, reported, and not
+    applied.  Every norm's weight stayed a plain ``Parameter``.  The loss curve
+    is unaffected (SP is an activation-layout optimisation), so nothing surfaces
+    it.  ``nn.RMSNorm`` was that case once; it is now covered rather than
+    refused, which is what the guard's message tells the next one to do.
 
     This is the same failure ``parallelize_tensor_parallel`` already refuses for
     TP -- "the plan names no module to shard" -- and it was only guarded on that
-    side.  A model with no ``LayerNorm`` anywhere has nothing for SP to do on
+    side.  A model with no recognised norm anywhere has nothing for SP to do on
     ANY stage, so refusing is never rejecting a working configuration.
 
     Checked against the **whole model**, not this rank's stage: under pipeline
@@ -253,12 +265,13 @@ def require_sequence_parallel_targets(module: Any) -> None:
         if isinstance(child, sequence_parallel_types()):
             return
     raise TPConfigurationError(
-        "parallel.sp_backend is set but this model contains no torch.nn.LayerNorm, "
-        "which is the only norm the sequence-parallel style can shard -- so it "
-        "would run with sequence parallelism configured and not applied, and "
-        "nothing would report it. A model using a different norm (nn.RMSNorm, or "
-        "a custom one) needs that type added to "
-        "parallel.tp.sequence_parallel_types(), or set sp_backend='none'.")
+        "parallel.sp_backend is set but this model contains no norm the "
+        "sequence-parallel style can shard (it knows "
+        f"{', '.join(sorted(item.__name__ for item in sequence_parallel_types()))}) "
+        "-- so it would run with sequence parallelism configured and not applied, "
+        "and nothing would report it. A model using another norm type needs that "
+        "type added to parallel.tp.sequence_parallel_types(), or set "
+        "sp_backend='none'.")
 
 
 def reduce_replicated_gradients(module: Any) -> int:

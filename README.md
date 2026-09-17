@@ -64,8 +64,16 @@ sharded checkpoint tell one logical tensor apart from one rank's slice of it.
 plan that names no module is **refused** rather than leaving every rank a full
 replica.
 
-**SP** — sequence-parallel activation of each `LayerNorm` over the TP group
-(`sequence_parallel_styles`). The sharding is written as a `Replicate ->
+**SP** — sequence-parallel activation of each norm over the TP group
+(`sequence_parallel_styles`). Norms are matched **structurally**, by type, so
+sequence parallelism imposes no naming convention on the model; what it covers
+is `LayerNorm` and `RMSNorm`. The style is indifferent to which of them it
+wraps — it shards the *sequence* axis and leaves the norm's own axis, the last
+one, whole on every rank — so anything normalising over the hidden dimension
+applies, and adding a type is a one-line change to `sequence_parallel_types`.
+A model whose norms are none of these is **refused**, not run with SP quietly
+absent: that was the old behaviour, and it is invisible in the loss because SP
+is an activation-layout optimisation. The sharding is written as a `Replicate ->
 Shard(1)` layout transition so DTensor's autograd supplies the gather and its
 reduce-scatter; a hand-rolled local `chunk` is measurably wrong, because its
 backward hands each rank only its own slice's contribution to the input
@@ -97,6 +105,30 @@ Two constraints worth knowing before you hit them:
 `GPipeSchedule` / `OneFOneBSchedule` (non-interleaved). `parallel/pp_schedule.py`
 is the only schedule implementation; `PipelineStage` delegates to it. Virtual and
 interleaved stages are outside the stable boundary.
+
+The split divides the model's **direct children**, so a model whose `forward` is
+not a chain of them needs to say what the units are. A HuggingFace model is the
+usual case: `LlamaForCausalLM`'s children are the trunk and the head, and its
+layers are one level further down, so the top-level split would put the whole
+transformer on stage 0. `execution_order` is the answer, and
+`parallel.pp_shapes.execution_units` documents the shape it returns — the ordered
+units including the glue, named without dots:
+
+```python
+def llama_execution_order(model):
+    return [("embed_tokens", model.model.embed_tokens),
+            *[(f"layer_{index}", layer)
+              for index, layer in enumerate(model.model.layers)],
+            ("norm", model.model.norm), ("lm_head", model.lm_head)]
+
+stages = parallelize(model, config=config, runtime=runtime,
+                     execution_order=llama_execution_order)
+```
+
+Without one, a split that would hand a stage a child **which cannot run at all**
+— a bare `nn.Module`, or the `nn.ModuleList` every HuggingFace model holds its
+layers in — is refused. That check is a proof rather than a heuristic: no
+assignment of those children to stages can execute.
 
 **FSDP** — `FULL_SHARD` over the explicit DP group, with TP/SP/PP axes kept
 orthogonal. A multi-rank run must opt in and use matching mesh dimensions:
@@ -232,7 +264,10 @@ what covers the optimizer's momentum, the step counters and every RNG stream.  A
 report ends with a table of every combination against every other, so "these are
 equivalent ways to run one training" is stated without reference to a baseline.
 
-It has found four real defects that every existing test missed.  The fourth is
+It has found four real defects that every existing test missed, plus the one
+that showed up in a model-decoupling review: sequence parallelism over a model
+whose norm it does not know used to run with SP configured and silently not
+applied, which no loss curve can show.  The fourth is
 the one worth reading the audit report for: with `tp_size>1`, sequence
 parallelism on and `dp_size=1`, a sharded checkpoint restored the parameters
 bit for bit and the optimizer momentum wrongly, so a resumed run continued 2e-01

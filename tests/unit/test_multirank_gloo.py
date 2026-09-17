@@ -174,8 +174,40 @@ def test_sequence_parallel_matches_dense():
     autograd supply the all-gather that the hand-written ``gather_sequence``
     used to do.
     """
-    payloads = require_success(run_case("sequence_parallel_matches_dense", 2,
-                                        hard_timeout=120.0))
+    _assert_sequence_parallel_numbers(require_success(
+        run_case("sequence_parallel_matches_dense", 2, hard_timeout=120.0)))
+
+
+def test_sequence_parallel_covers_rmsnorm_too():
+    """``nn.RMSNorm`` is what a Llama uses, and the style has to cover it.
+
+    Before this, it did not: the style matched ``torch.nn.LayerNorm`` only, so a
+    Llama-shaped model at ``tp_size=2`` with ``sp_backend='megatron'`` sharded
+    nothing while reporting success.  That is now refused rather than ignored
+    (``require_sequence_parallel_targets``), and this case is the other half:
+    the type list was extended instead of only guarded, because the style is
+    indifferent to which norm it wraps.  It shards the **sequence** axis and
+    leaves the norm its own axis -- the last one -- whole on every rank, so
+    anything that normalises over the hidden dimension applies.
+
+    Running the SAME assertions as the LayerNorm case is the point.  The numbers
+    alone would not have been enough: a style that sharded nothing matches dense
+    exactly, which is why the shared body also asserts the activation is a
+    ``Shard`` DTensor of half the sequence, and that the optimizer's momentum
+    ends up replicated.
+    """
+    _assert_sequence_parallel_numbers(require_success(
+        run_case("sequence_parallel_matches_dense", 2, options={"norm": "rmsnorm"},
+                 hard_timeout=120.0)))
+
+
+def _assert_sequence_parallel_numbers(payloads) -> None:
+    """Every claim the SP cases make, applied to whichever norm type they ran.
+
+    Shared between the LayerNorm and RMSNorm cases so the two cannot drift
+    apart: the RMSNorm case exists to answer "does the style cover this norm
+    type", and that is only answered if it is asked with the same assertions.
+    """
     for payload in payloads:
         assert payload["forward_error"] < TOLERANCE
         assert payload["input_grad_error"] < TOLERANCE, (
@@ -183,7 +215,10 @@ def test_sequence_parallel_matches_dense():
             "hand-rolled scatter loses")
         assert payload["weight_grad_error"] < TOLERANCE, (
             "the replicated norm parameters did not receive the reduced gradient")
-        assert payload["bias_grad_error"] < TOLERANCE
+        # None when the norm has no bias at all (nn.RMSNorm is weight-only), so
+        # this is a skip when the parameter does not exist, not a pass.
+        if payload["bias_grad_error"] is not None:
+            assert payload["bias_grad_error"] < TOLERANCE
 
         # The error columns above are all computed through ``full_tensor()``,
         # which ALL-REDUCES a Partial placement -- so a norm gradient that was
@@ -230,18 +265,46 @@ def test_sequence_parallel_matches_dense():
             "style that shards nothing would still match the dense numbers exactly")
 
 
-def test_sequence_parallel_refuses_at_world_two_without_a_layernorm():
+def test_pipeline_nested_model_needs_an_execution_order():
+    """The pass-through, and the split each rank ends up with.
+
+    ``test_pp_shapes`` covers the split in one process; this covers the wiring,
+    which is where a silent failure would live: an ``execution_order`` that
+    ``parallelize`` dropped on the floor would look exactly like a caller that
+    never passed one, and the two ranks would have to agree about the stages or
+    the schedule would hang rather than fail.
+    """
+    payloads = require_success(run_case("pipeline_needs_execution_order_for_a_nested_model", 2,
+                                        hard_timeout=120.0))
+    for payload in payloads:
+        assert payload["refused"] is True
+        assert "defines no forward" in payload["message"], (
+            f"refused for the wrong reason: {payload['message']}")
+        assert payload["stage_count"] == 2
+
+    # Each rank holds the stage its pp coordinate says, and the layer stack is
+    # actually divided rather than gathered onto one of them.
+    by_stage = {payload["stage_id"]: payload["units"] for payload in payloads}
+    assert sorted(by_stage) == [0, 1], "both stages must be represented"
+    assert by_stage[0] == ["embed_tokens", "layer_0", "layer_1", "layer_2"]
+    assert by_stage[1] == ["layer_3", "norm", "lm_head"]
+
+
+def test_sequence_parallel_refuses_at_world_two_for_an_unknown_norm():
     """The refusal has to reach the real call path, at every rank.
 
     The unit test in ``test_sp_single`` checks the guard function; this checks
     that ``parallelize`` actually calls it, and that the model the guard rejects
     is rejected on BOTH ranks rather than on the one that happened to look
     first -- a refusal that is not rank-consistent is a hang, not an error.
+
+    The norm here is the model's own rather than ``nn.RMSNorm``: that one is
+    shardable and covered by ``test_sequence_parallel_covers_rmsnorm_too``.
     """
-    for payload in require_success(run_case("sequence_parallel_refuses_without_layernorm", 2,
+    for payload in require_success(run_case("sequence_parallel_refuses_an_unknown_norm", 2,
                                             hard_timeout=120.0)):
         assert payload["refused"] is True
-        assert "no torch.nn.LayerNorm" in payload["message"], (
+        assert "no norm the sequence-parallel style can shard" in payload["message"], (
             f"refused for the wrong reason: {payload['message']}")
         # And the same block with a LayerNorm is still sharded, so the guard is
         # about the norm type and not about refusing SP in general.

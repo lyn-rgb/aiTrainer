@@ -114,21 +114,35 @@ def _create_groups(mapping):
 # --------------------------------------------------------------------------- #
 # §4.10 b/c -- tensor parallelism and sequence parallelism, over DTensor
 # --------------------------------------------------------------------------- #
-def _tp_block(hidden: int):
+def _tp_block(hidden: int, norm: str = "layernorm"):
     """A block whose projections the default plan names, with a norm in front.
 
     ``norm`` receives the replicated residual stream, which is the arrangement
     a real transformer has -- and the one that made torch's own
     ``SequenceParallel`` unusable here (it assumes its input is already a
     per-rank slice and silently mis-annotates otherwise).
+
+    ``norm`` selects the type, because the SP style matches structurally and the
+    question "which norm types does that cover" is answerable only by running
+    the same assertions against each.  ``rmsnorm`` is what a Llama uses.
     """
     import torch
     from torch import nn
 
+    if norm == "rmsnorm":
+        norm_class = getattr(nn, "RMSNorm", None)
+        if norm_class is None:
+            raise AssertionError("this torch has no nn.RMSNorm, so the case cannot run")
+        make_norm = lambda: norm_class(hidden)
+    elif norm == "layernorm":
+        make_norm = lambda: nn.LayerNorm(hidden)
+    else:
+        raise AssertionError(f"unknown norm {norm!r}")
+
     class Block(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.norm = nn.LayerNorm(hidden)
+            self.norm = make_norm()
             self.q_proj = nn.Linear(hidden, hidden)
             self.o_proj = nn.Linear(hidden, hidden)
 
@@ -360,14 +374,15 @@ def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) 
     from aitrainer.parallelizer import parallelize
 
     hidden, batch, length, seed = 8, 2, 6, 4242
+    norm = options.get("norm", "layernorm")
     torch.manual_seed(seed)
-    dense = _tp_block(hidden)
+    dense = _tp_block(hidden, norm)
     generator = torch.Generator().manual_seed(99)
     value = torch.randn(batch, length, hidden, generator=generator).requires_grad_(True)
     dense(value).square().mean().backward()
 
     torch.manual_seed(seed)
-    block = _tp_block(hidden)
+    block = _tp_block(hidden, norm)
     config = FrameworkConfig.from_dict({"parallel": {"tp_size": world, "sp_backend": "megatron"}})
     runtime = Runtime(device="cpu", init_process_group=False)
     model = parallelize(block, config=config, runtime=runtime)
@@ -397,11 +412,17 @@ def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) 
 
     # Read everything about this backward BEFORE stepping a trainer: train_step
     # ends in ``optimizer.zero_grad(set_to_none=True)``, which would clear these.
+    # nn.RMSNorm has a weight and no bias, so the bias column is reported as None
+    # rather than compared against a parameter that does not exist.  The caller
+    # decides whether that is acceptable; see the shared assertion body.
+    has_bias = hasattr(model.norm, "bias")
     numeric = {
         "rank": rank, "forward_error": forward_error,
         "input_grad_error": _max_abs_diff(_full(inputs.grad), value.grad),
         "weight_grad_error": _max_abs_diff(_full(gradient), dense.norm.weight.grad),
-        "bias_grad_error": _max_abs_diff(_full(model.norm.bias.grad), dense.norm.bias.grad),
+        "bias_grad_error": (
+            _max_abs_diff(_full(model.norm.bias.grad), dense.norm.bias.grad)
+            if has_bias else None),
         "observed": observed, "world": world, "sequence_length": length,
     }
     # 1. The cause.  A bare backward over a sharded activation leaves the norm's
@@ -449,24 +470,98 @@ def ulysses_attention_equivalence(rank: int, world: int, dist, options: dict) ->
     return {"rank": rank, "error": _max_abs_diff(out, dense)}
 
 
-@case("sequence_parallel_refuses_without_layernorm")
-def sequence_parallel_refuses_without_layernorm(rank: int, world: int, dist, options: dict) -> dict:
+@case("pipeline_needs_execution_order_for_a_nested_model")
+def pipeline_needs_execution_order_for_a_nested_model(rank: int, world: int, dist, options: dict) -> dict:
+    """A HuggingFace-shaped model must be told what the pipeline split divides.
+
+    ``LlamaForCausalLM``'s direct children are the trunk and the head; its
+    layers sit one level down inside ``model.layers``.  Splitting at the top
+    level used to come back without complaint as ``['model']``/``['lm_head']``,
+    putting the whole transformer on stage 0, and the failure only appeared when
+    stage 0 was first called -- ``NotImplementedError: Module [Module] is
+    missing the required "forward" function``, naming neither the split nor the
+    module responsible.
+
+    This case checks the wiring rather than the split itself (``test_pp_shapes``
+    covers that): that ``parallelize`` passes ``execution_order`` through, and
+    that each rank ends up with the stage it should.  Both halves matter -- a
+    pass-through that reached only rank 0 would deadlock in the schedule, not
+    fail here.
+    """
+    import torch
+
+    from aitrainer import FrameworkConfig, Runtime, parallelize
+    from aitrainer.parallel.pp_shapes import PipelineShapeError
+
+    class LlamaShaped(torch.nn.Module):
+        def __init__(self, layers: int = 4) -> None:
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(32, 8)
+            self.model.layers = torch.nn.ModuleList(
+                [torch.nn.Linear(8, 8) for _ in range(layers)])
+            self.model.norm = torch.nn.LayerNorm(8)
+            self.lm_head = torch.nn.Linear(8, 32)
+
+        def forward(self, ids):
+            hidden = self.model.embed_tokens(ids)
+            for layer in self.model.layers:
+                hidden = layer(hidden)
+            return self.lm_head(self.model.norm(hidden))
+
+    def execution_order(model):
+        return [("embed_tokens", model.model.embed_tokens),
+                *[(f"layer_{index}", layer)
+                  for index, layer in enumerate(model.model.layers)],
+                ("norm", model.model.norm),
+                ("lm_head", model.lm_head)]
+
+    config = FrameworkConfig.from_dict(
+        {"parallel": {"pp_size": world, "pp_schedule": "gpipe", "num_microbatches": world}})
+
+    torch.manual_seed(3)
+    runtime = Runtime(device="cpu", seed=3)
+    try:
+        parallelize(LlamaShaped(), config=config, runtime=runtime)
+    except PipelineShapeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError(
+            "pp over a nested model did not refuse; the split cannot run and "
+            "would only fail later, inside the stage's forward")
+
+    torch.manual_seed(3)
+    runtime = Runtime(device="cpu", seed=3)
+    stage = parallelize(LlamaShaped(), config=config, runtime=runtime,
+                        execution_order=execution_order)
+    return {"rank": rank, "refused": True, "message": message,
+            "stage_id": int(stage.stage_id), "stage_count": int(stage.pp_size),
+            "units": list(stage.module.layer_names)}
+
+
+@case("sequence_parallel_refuses_an_unknown_norm")
+def sequence_parallel_refuses_an_unknown_norm(rank: int, world: int, dist, options: dict) -> dict:
     """SP over a model whose norms it cannot shard must refuse at every rank.
 
-    Measured before the guard existed: ``tp_size=2`` with
-    ``sp_backend='megatron'`` over a model using ``nn.RMSNorm`` raised nothing
+    Measured before the guard existed, on a model using a norm type the style
+    has no term for: ``tp_size=2`` with ``sp_backend='megatron'`` raised nothing
     and left every norm's weight a plain ``Parameter`` -- sequence parallelism
     configured, reported, and absent.  The TP plan matched the projections, so
     the neighbouring "names no module to shard" guard had no reason to fire,
     which is exactly why this case has to keep the projections nameable: remove
     them and TP refuses first, and the test would pass for the wrong reason.
+
+    The norm is the model's own rather than ``nn.RMSNorm``, which is now
+    supported and covered by ``sequence_parallel_matches_dense`` with
+    ``norm=rmsnorm``.  The remaining case is a type nobody has taught the style
+    about, and the guard has to keep catching it.
     """
     import torch
 
     from aitrainer import FrameworkConfig, Runtime, parallelize
     from aitrainer.parallel.tp import TPConfigurationError
 
-    class RMSNorm(torch.nn.Module):
+    class CustomNorm(torch.nn.Module):
         def __init__(self, dim: int) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(torch.ones(dim))
@@ -490,12 +585,12 @@ def sequence_parallel_refuses_without_layernorm(rank: int, world: int, dist, opt
     torch.manual_seed(5)
     runtime = Runtime(device="cpu", init_process_group=False, seed=5)
     try:
-        parallelize(Block(RMSNorm(8)), config=config, runtime=runtime)
+        parallelize(Block(CustomNorm(8)), config=config, runtime=runtime)
     except TPConfigurationError as exc:
         message = str(exc)
     else:
         raise AssertionError(
-            "SP over an RMSNorm model did not refuse; it would have run with "
+            "SP over a model with an unknown norm did not refuse; it would have run with "
             "sequence parallelism configured and silently not applied")
 
     # The counterfactual, in the same case so the two cannot drift apart: the

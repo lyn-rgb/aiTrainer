@@ -93,8 +93,13 @@ def test_sequence_parallel_refuses_a_model_it_cannot_shard():
         require_sequence_parallel_targets,
     )
 
-    class RMSNorm(torch.nn.Module):
-        """Llama's norm, and not a ``torch.nn.LayerNorm``."""
+    class CustomNorm(torch.nn.Module):
+        """A norm of the model's own, which the style has no term for.
+
+        Not ``nn.RMSNorm``: that one IS shardable and is covered -- see
+        ``test_sequence_parallel_covers_rmsnorm_too``.  The type list is finite
+        and a model that invents its own norm is the case that remains.
+        """
 
         def __init__(self, dim: int) -> None:
             super().__init__()
@@ -109,8 +114,8 @@ def test_sequence_parallel_refuses_a_model_it_cannot_shard():
             self.norm = norm
             self.q_proj = torch.nn.Linear(8, 8)
 
-    with pytest.raises(TPConfigurationError, match="no torch.nn.LayerNorm"):
-        require_sequence_parallel_targets(Block(RMSNorm(8)))
+    with pytest.raises(TPConfigurationError, match="no norm the sequence-parallel"):
+        require_sequence_parallel_targets(Block(CustomNorm(8)))
 
     # The counterfactual: the same block with a LayerNorm passes, so the refusal
     # is about the norm type and not about the block's shape.

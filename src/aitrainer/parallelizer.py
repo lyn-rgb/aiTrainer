@@ -20,13 +20,20 @@ from .distributed_model import PipelineStage
 
 def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
                 process_group: Any = None, tp_plan: TransformerTPPlan | None = None,
-                mesh: DeviceMeshManager | None = None) -> Any:
+                mesh: DeviceMeshManager | None = None,
+                execution_order: Any = None) -> Any:
     """Apply the validated composition in a deterministic ownership order.
 
     The returned object owns only the current PP stage.  TP/SP modules are
     built against the TP group and FSDP wraps that stage using only the DP
     group.  Supplying a pre-created mesh is recommended; otherwise one is
     created from the validated configuration and runtime world size.
+
+    ``execution_order`` is how a model whose ``forward`` is not a chain of its
+    direct children -- a HuggingFace model, where the layers sit inside an inner
+    module -- declares what the pipeline split should divide.  It is passed
+    straight to :func:`parallel.pp_shapes.split_sequential`, which documents the
+    shape it has to return and refuses a split it can prove cannot run.
     """
     validate_capabilities(config, world_size=runtime.world_size)
     if runtime.world_size > 1:
@@ -52,7 +59,8 @@ def parallelize(model: Any, *, config: FrameworkConfig, runtime: Any,
     coordinate = mesh.coordinate
     if config.parallel.pp_size > 1:
         policy = config.planning.stage_policy if config.planning.enabled else "uniform_layers"
-        stages = split_sequential(model, config.parallel.pp_size, policy=policy)[0]
+        stages = split_sequential(model, config.parallel.pp_size, policy=policy,
+                                  execution_order=execution_order)[0]
         stage_id = coordinate.pp
         stage = stages[stage_id]
     else:

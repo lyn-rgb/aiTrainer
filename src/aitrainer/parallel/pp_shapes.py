@@ -20,8 +20,8 @@ from ..core.torch import module_base
 # them from.  The list is load-bearing: without it ruff reads the imports as
 # unused and deletes them.
 __all__ = ["PipelineSequence", "PipelineShapeError", "StagePlan", "TensorSpec",
-           "normalize_loss", "plan_stages", "split_microbatches", "split_sequential",
-           "stage_assignment"]
+           "execution_units", "normalize_loss", "plan_stages", "split_microbatches",
+           "split_sequential", "stage_assignment"]
 
 # Must be an expression at import time: the class below inherits from it.
 ModuleBase, nn = module_base()
@@ -151,23 +151,113 @@ def plan_stages(layers: Sequence[Any], pp_size: int, *, policy: str = "uniform_l
     return tuple(plans)
 
 
+def execution_units(module: Any, pp_size: int, *, execution_order: Any = None
+                    ) -> list[tuple[str, Any]]:
+    """The ordered ``(name, module)`` pairs a pipeline split divides.
+
+    By default that is ``module.named_children()``, which requires the model's
+    ``forward`` to be a plain chain of its **direct** children -- the contract
+    this function has always carried, and one that a HuggingFace model does not
+    meet.  ``LlamaForCausalLM``'s direct children are ``model`` (the whole
+    trunk) and ``lm_head``; its four transformer layers are one level further
+    down, inside ``model.layers``.  Splitting at the top level therefore puts
+    the entire transformer on stage 0, and the parameter counts make that plain
+    before anything runs.
+
+    ``execution_order`` is the way out, and it is the caller's to write because
+    only they know how their model's ``forward`` is composed.  It receives the
+    module and returns the ordered units, including the glue::
+
+        def llama_execution_order(model):
+            return [("embed_tokens", model.model.embed_tokens),
+                    *[(f"layer_{index}", layer)
+                      for index, layer in enumerate(model.model.layers)],
+                    ("norm", model.model.norm),
+                    ("lm_head", model.lm_head)]
+
+    Names must be dot-free: :class:`PipelineSequence` registers each unit with
+    ``add_module``, which rejects ``"."``.  They are the stage's checkpoint keys
+    and the prefixes its TP styles are addressed by, so the leaf names are what
+    matter -- ``layer_0.attn.q_proj`` still matches ``q_proj`` in the default
+    plan.
+
+    With no ``execution_order``, a split that would hand some stage a child
+    **which cannot run at all** is refused rather than returned: see
+    :func:`_refuse_unrunnable_units`.
+    """
+    if execution_order is not None:
+        units = list(execution_order(module))
+        for name, _ in units:
+            if not name or "." in name:
+                raise PipelineShapeError(
+                    f"execution_order returned the unit name {name!r}; names must be "
+                    "non-empty and must not contain '.', because PipelineSequence "
+                    "registers each unit with nn.Module.add_module, which rejects "
+                    "dots. Use one name per unit, e.g. 'layer_0'.")
+        return units
+    named = list(module.named_children())
+    _refuse_unrunnable_units(named, pp_size)
+    return named
+
+
+def _refuse_unrunnable_units(named: Sequence[tuple[str, Any]], pp_size: int) -> None:
+    """Refuse a split whose stages are guaranteed to fail at forward time.
+
+    A ``PipelineSequence`` runs each child by calling it, so a child with no
+    ``forward`` of its own -- a bare ``nn.Module``, or an ``nn.ModuleList``,
+    which is how every HuggingFace model holds its layers -- can never be a
+    pipeline unit.  Measured on a Llama-shaped module at ``pp_size=2``: the split
+    returned ``['model']`` and ``['lm_head']`` without complaint, and the
+    failure only appeared when stage 0 was first called, as
+
+        NotImplementedError: Module [Module] is missing the required "forward"
+        function
+
+    -- which names neither the pipeline split nor the module that caused it.
+    The check proves something stronger than "this looks wrong": no assignment
+    of these children to stages can run.
+
+    Only checked on the default path.  A caller who supplied ``execution_order``
+    has already said what the units are.
+    """
+    if pp_size <= 1 or nn is None:
+        return
+    base_forward = getattr(nn.Module, "forward", None)
+    broken = [name for name, child in named
+              if getattr(type(child), "forward", None) is base_forward]
+    if not broken:
+        return
+    raise PipelineShapeError(
+        f"pp_size={pp_size} cannot split {broken} -- "
+        f"{'these modules' if len(broken) > 1 else 'this module'} defines no forward, "
+        "so a pipeline stage holding it could never run. A module holding its "
+        "layers in an nn.ModuleList (or an inner module) cannot be split by "
+        "named_children(); pass execution_order to say what the stages are. See "
+        "parallel.pp_shapes.execution_units for the shape it has to return.")
+
+
 def split_sequential(module: Any, pp_size: int, *, policy: str = "uniform_layers",
-                     sample: Any = None) -> tuple[Any, tuple[StagePlan, ...]]:
+                     sample: Any = None, execution_order: Any = None
+                     ) -> tuple[Any, tuple[StagePlan, ...]]:
     """Split a module with an ordered ``named_children()`` contract into stages.
 
     The split **keeps the original module names** (see :class:`PipelineSequence`),
     which is what lets a name-matching TP plan address a pipeline stage and what
     keeps each stage's checkpoint keys distinct.
+
+    ``execution_order`` overrides what the split divides: see
+    :func:`execution_units`, which also documents the model shape the default
+    cannot handle.
     """
-    named = list(module.named_children())
-    layers = [layer for _, layer in named]
+    units = execution_units(module, pp_size, execution_order=execution_order)
+    layers = [layer for _, layer in units]
     plans = plan_stages(layers, pp_size, policy=policy, sample=sample)
-    stages = tuple(PipelineSequence(named[p.start:p.stop]) for p in plans)
+    stages = tuple(PipelineSequence(units[p.start:p.stop]) for p in plans)
     return stages, plans
 
 
 def stage_assignment(model: Any, pp_size: int, *, policy: str = "uniform_layers",
-                     sample: Any = None) -> dict[str, int]:
+                     sample: Any = None, execution_order: Any = None) -> dict[str, int]:
     """``{parameter name: stage index}`` for the split :func:`split_sequential` makes.
 
     ``CheckpointConverter.convert`` needs this to write per-stage files, and it
@@ -181,7 +271,8 @@ def stage_assignment(model: Any, pp_size: int, *, policy: str = "uniform_layers"
     there); with the position-renaming ``nn.Sequential`` every stage reported
     ``0.weight`` and the mapping would have been useless.
     """
-    stages, plans = split_sequential(model, pp_size, policy=policy, sample=sample)
+    stages, plans = split_sequential(model, pp_size, policy=policy, sample=sample,
+                                     execution_order=execution_order)
     assignment: dict[str, int] = {}
     for plan, stage in zip(plans, stages):
         for name, _ in stage.named_parameters():
