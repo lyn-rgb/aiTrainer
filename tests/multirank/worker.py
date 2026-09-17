@@ -452,22 +452,57 @@ def sequence_parallel_matches_dense(rank: int, world: int, dist, options: dict) 
 # --------------------------------------------------------------------------- #
 @case("ulysses_attention_equivalence")
 def ulysses_attention_equivalence(rank: int, world: int, dist, options: dict) -> dict:
-    """Head-parallel attention must reproduce dense SDPA exactly."""
+    """Head-parallel attention must reproduce dense SDPA exactly.
+
+    On Gloo this is expected to FAIL -- ``all_to_all`` has no Gloo
+    implementation -- and the caller asserts that it does, so that the CUDA path
+    is not mistaken for a working one.  On the Linux CI runner a rank completed
+    it instead, which should be impossible, so the case now reports rather than
+    raises: it returns whether the call failed, and the facts that decide the
+    only branch that can skip the communication entirely.
+
+    ``sp_ulysses._all_to_all_impl`` returns its input unchanged when
+    ``world_size(group) == 1``, and ``core.torch.world_size`` answers 1 whenever
+    ``is_distributed()`` is false.  So a process group that is not actually up
+    does not produce an error here -- it produces a silently local computation
+    that looks like success.  Whether that is what happened on CI is exactly
+    what these facts settle.
+    """
     import torch
 
+    from aitrainer.core.torch import is_distributed, world_size
     from aitrainer.parallel.sp_ulysses import distributed_attention
 
     group = _tp_group(world, rank)
+    facts: dict = {"rank": rank,
+                   "torch": torch.__version__,
+                   "torch_built_cuda": torch.version.cuda,
+                   "cuda_available": torch.cuda.is_available()}
+    for label, probe in (("dist_is_initialized", dist.is_initialized),
+                         ("core_is_distributed", is_distributed),
+                         ("default_world_size", dist.get_world_size),
+                         ("group_world_size", lambda: dist.get_world_size(group)),
+                         ("core_world_size", lambda: world_size(group)),
+                         ("backend", lambda: dist.get_backend(group))):
+        try:
+            facts[label] = probe()
+        except Exception as exc:                                # noqa: BLE001 - reported
+            facts[label] = f"{type(exc).__name__}: {exc}"
+
     batch, length, heads, head_dim = 2, 8, 4, 4
     torch.manual_seed(99)
     q, k, v = (torch.randn(batch, length, heads, head_dim) for _ in range(3))
+    try:
+        out = distributed_attention(q, k, v, group=group)
+    except Exception as exc:                                    # noqa: BLE001 - reported
+        return {"rank": rank, "failed": True, "failure": f"{type(exc).__name__}: {exc}",
+                "facts": facts}
 
-    out = distributed_attention(q, k, v, group=group)
-    _require(tuple(out.shape) == (batch, length, heads, head_dim),
-             f"output shape {tuple(out.shape)} != {(batch, length, heads, head_dim)}")
     dense = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
-    return {"rank": rank, "error": _max_abs_diff(out, dense)}
+    return {"rank": rank, "failed": False, "failure": None,
+            "shape": list(out.shape), "error": _max_abs_diff(out, dense),
+            "facts": facts}
 
 
 @case("pipeline_needs_execution_order_for_a_nested_model")

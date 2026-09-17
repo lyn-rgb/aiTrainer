@@ -25,6 +25,7 @@ code alone.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -105,9 +106,15 @@ def test_group_creation_order_is_load_bearing():
     results = run_case("groups_legacy_order_deadlocks", 4, shape="2,2,1",
                        timeout_seconds=3.0, hard_timeout=10.0,
                        retry_on_rendezvous=False)
+    # The worker already distinguishes the two outcomes -- it returns a "did not
+    # block" note when the control does not reproduce -- so the failure message
+    # carries what each rank actually did.  Without it the assertion says only
+    # that something completed, which is the part that was already known.
+    observed = [r.result for r in results if r.result] or [r.describe() for r in results]
     assert not all(result.returncode == 0 for result in results), (
         "the removed ordering completed cleanly, so the canonical ordering fix "
-        "is not what makes group creation terminate")
+        "is not what makes group creation terminate. What the ranks reported: "
+        f"{json.dumps(observed, sort_keys=True)}")
     combined = " ".join((result.error or "") + result.stderr for result in results)
     assert "wait timeout" in combined or "TimeoutExpired" in combined, (
         f"expected a store-barrier timeout from the legacy ordering, got:\n{combined[-2000:]}")
@@ -356,10 +363,17 @@ def test_ulysses_head_exchange_requires_nccl_not_gloo():
     Gloo gains all-to-all this test starts failing, which is the signal to turn
     on the equivalence check instead.
     """
-    results = run_case("ulysses_attention_equivalence", 2, hard_timeout=60.0)
-    assert all(result.returncode != 0 for result in results)
-    assert all("alltoall" in (result.error or "") for result in results), (
-        "expected an unsupported-alltoall failure from Gloo")
+    payloads = require_success(run_case("ulysses_attention_equivalence", 2, hard_timeout=60.0))
+    for payload in payloads:
+        assert payload["failed"], (
+            f"rank {payload['rank']} ran Ulysses attention on Gloo and returned "
+            f"shape {payload.get('shape')} with max|diff| {payload.get('error')} "
+            f"against dense SDPA -- the all-to-all did not happen, so this is a "
+            f"local computation wearing a success. Environment: "
+            f"{json.dumps(payload['facts'], sort_keys=True)}")
+        assert "alltoall" in payload["failure"], (
+            f"rank {payload['rank']} failed for the wrong reason: {payload['failure']}. "
+            f"Environment: {json.dumps(payload['facts'], sort_keys=True)}")
 
 
 def test_fsdp_initialises_on_a_cpu_only_host():
